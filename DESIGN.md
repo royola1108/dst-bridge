@@ -1,57 +1,97 @@
-# DST Bridge — 饥荒联机版 AI 接入设计文档
+# DST Agent Runtime — 饥荒联机版 AI 接入设计文档
 
-> 让 LLM 通过 `dst` CLI 玩 Don't Starve Together，不需要 OCR，不需要截图识别。
-> 架构参考 Disco Engine：REST API + Skill CLI，输出紧凑文本省 token。
+> 让 AI 玩 Don't Starve Together，不需要 OCR，不需要截图识别。
+> 三层架构：Claude 策略层 + DeepSeek 应变层 + Bridge 确定性执行层。
+> CLI 输出紧凑文本省 token，参考 Disco Engine 模式。
 
 ---
 
 ## 1. 一句话
 
-DST mod 做出站 HTTP 把游戏状态发给 Bridge Server，Claude 通过 `dst` CLI 读状态 + 发命令，DST mod 轮询拉取命令并通过 BufferedAction 执行。
+DST mod 做出站 HTTP 上报状态，Bridge Server 做 agent runtime（缓存状态 + 执行 macro-action + 紧急应变），Claude 通过 `dst` CLI 下高层目标，DeepSeek 在 Bridge 内部处理秒级紧急决策。
 
 ---
 
-## 2. 为什么是 Skill CLI 而不是 MCP
+## 2. 三层架构
 
-### 2.1 Disco Engine 已验证的模式
+### 2.1 为什么不直接让 LLM 微操
 
-Disco Engine 双入口：REST API（`/api/<tool>`，返回纯文本）+ MCP（`/mcp`，返回 JSON）。`disco` CLI 调 REST API，SKILL.md 教 Claude 用 CLI。
+DST 是实时游戏。如果 LLM 每 2 秒做一次 `walk → chop → pickup → check`，会有三个问题：
 
-**实测结论**: Skill CLI 路径更省 token，因为输出是定制紧凑文本而非 JSON。
+1. **太贵** — 每分钟 30 次调用，Claude 每次几千 token
+2. **太慢** — LLM 响应 2-5 秒，角色在等待中可能被打死
+3. **太碎** — LLM 不该关心"走到哪棵树旁边"，该关心"收集 20 根木头"
 
-### 2.2 Token 对比
+### 2.2 三层分工
 
-同样一次"读取状态"：
+```
+Layer 3: Claude (策略层, 贵, 慢, 几分钟一次)
+  "天黑前建好营地，先收集 20 木头"
+  dst goal "gather logs 20"
+  dst goal "build campfire"
+  dst situation        ← 汇总状态 + 正在做什么 + 需要注意什么
+  dst interrupt        ← 紧急叫停
+
+Layer 2: Bridge Server (agent runtime, 本地, 毫秒级)
+  ├── Macro Executor    ← 确定性行为循环：找树→装备→砍→捡→计数→达标/失败
+  ├── Reflex Engine     ← 紧急事件 → 问 DeepSeek 或执行规则 → 自动应变
+  ├── Command Lifecycle ← queued→leased→executing→done/fail/timeout
+  ├── State Model       ← 世界状态缓存 + 新鲜度检查
+  └── Event Log         ← 事件历史
+
+Layer 2.5: DeepSeek (应变层, 便宜, 快, 秒级)
+  Bridge 遇到意外/紧急 → 调 DeepSeek API → 秒回决策 → Bridge 执行
+  "HP 80 被蜘蛛打，手里有斧头，附近3m有火堆，打还是跑？" → "跑向火堆"
+
+Layer 1: DST Mod (传感器 + 执行器, Lua, 尽量傻)
+  感知 → POST /tick → 拉命令 → 执行 BufferedAction → 上报结果
+```
+
+### 2.3 成本对比
+
+| 方案 | Claude 调用 | DeepSeek 调用 | 一小时成本 |
+|---|---|---|---|
+| 纯 Claude 微操 | ~1800 次 | 0 | 高 |
+| Claude 策略 + 纯规则应变 | ~10 次 | 0 | 最低但不灵活 |
+| **Claude 策略 + DeepSeek 应变** | **~10 次** | **~60 次** | **极低** |
+
+Claude 只管几分钟一次的高层目标，DeepSeek 补"纯规则太死板"和"Claude 太贵"之间的空档。
+
+---
+
+## 3. 为什么是 Skill CLI 而不是 MCP
+
+### 3.1 Disco Engine 已验证的模式
+
+Disco Engine 双入口：REST API + CLI（`disco` 命令）。CLI 调 REST API，SKILL.md 教 Claude 用 CLI。**Skill CLI 更省 token**，因为输出是定制紧凑文本而非 JSON。
+
+### 3.2 Token 对比
 
 ```
 # MCP 返回 JSON (~1000 tokens)
-{"connected":true,"player":{"health":150,"maxHealth":150,"hunger":120,"maxHunger":150,...},"world":{...}}
+{"connected":true,"player":{"health":150,"hunger":120,...},"world":{...}}
 
 # CLI 返回文本 (~200 tokens)
 HP:150/150 Hgr:120/150 San:180/200 Day5 Autumn dusk
-Pos:(120,-340) Light:yes Busy:no
-Nearby: tree#12345 7m R[chop] sapling#12346 3m FL[pick] rabbit#12347 12m R[atk]
-Inv: axe(x80) logx15 cutgrassx8 flintx3 twigsx2
-Equip: axe
-Recipes: campfire[✓] axe[✗ need twigs]
+Nearby: tree#12345 7m R[chop] sapling#12346 3m FL[pick]
+Inv: axe(x80) logx15 cutgrassx8
 ```
 
-DST 是准实时游戏，每 2 秒一次状态读取。100 次调用累计：MCP ~100K tokens，CLI ~20K tokens。**5 倍差距**。
+**5 倍差距**。DST 是准实时游戏，调用频繁，差距累积巨大。
 
-### 2.3 配置成本
+### 3.3 配置成本
 
 | | MCP | Skill CLI |
 |---|---|---|
 | 需要 `claude mcp add` | 是 | **否** |
 | 需要 MCP server 进程 | 是 | **否** |
 | Claude 发现方式 | MCP 连接 | Claude Code 读 SKILL.md 自动发现 |
-| Bridge Server 复杂度 | REST + MCP 两套 | **只 REST 一套** |
 
-MCP 作为可选入口以后加回来（跟 Disco Engine 一样），但 MVP 阶段只做 CLI。
+MCP 以后作为可选入口加回来，MVP 阶段只做 CLI。
 
 ---
 
-## 3. DST 的约束
+## 4. DST 的约束
 
 | 能力 | 支持？ | 说明 |
 |---|---|---|
@@ -64,462 +104,637 @@ MCP 作为可选入口以后加回来（跟 Disco Engine 一样），但 MVP 阶
 | 监听端口 | **否** | 沙盒环境，不能起 HTTP server |
 | 写本地文件 | **受限** | 只能写特定保存目录，不适合实时 IPC |
 
-**结论**: DST mod 只能做出站 HTTP。Bridge Server 做中间人，CLI 调 Bridge Server 的 REST API。
+**结论**: DST mod 只能做出站 HTTP。Bridge Server 做中间人。
 
 ---
 
-## 4. 系统架构
+## 5. 系统架构
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Claude (Claude Code / 任何 LLM agent)                    │
-│  读 SKILL.md 学会 `dst` 命令                               │
-│  bash: dst state → dst chop 12345 → dst state ...        │
-└──────────────────────────┬───────────────────────────────┘
-                           │ bash 调 dst CLI
-                           │ (dst CLI 内部调 REST API)
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  dst CLI (Node.js 脚本, 在 PATH 里)                        │
-│  dst state / dst nearby / dst chop / dst build ...       │
-│  读 ~/.dst-bridge.json 获取 server URL                     │
-│  POST http://localhost:3001/api/<tool>                    │
-│  输出紧凑文本                                              │
-└──────────────────────────┬───────────────────────────────┘
-                           │ HTTP (localhost)
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Bridge Server (Node.js, localhost:3001)                  │
-│                                                          │
-│  ├── REST API (一套, 给 CLI 和 DST mod 共用)               │
-│  │                                                      │
-│  │   给 DST mod (内部上报):                               │
-│  │   POST /state     ← DST mod 上报游戏状态               │
-│  │   GET  /commands  → DST mod 拉取待执行命令              │
-│  │   POST /result    ← DST mod 上报命令执行结果            │
-│  │   POST /event     ← DST mod 上报即时事件               │
-│  │   GET  /config    → DST mod 拉取配置                   │
-│  │                                                      │
-│  │   给 CLI (Claude 调):                                  │
-│  │   POST /api/state      → 紧凑文本状态                   │
-│  │   POST /api/nearby     → 紧凑文本附近实体               │
-│  │   POST /api/inventory  → 紧凑文本背包                   │
-│  │   POST /api/events     → 紧凑文本事件                   │
-│  │   POST /api/do         → 排队动作                      │
-│  │   POST /api/queue      → 查看/管理命令队列              │
-│  │   POST /api/status     → bridge 连接状态               │
-│  │                                                      │
-│  ├── 状态缓存 (in-memory)                                 │
-│  │   currentState    最新一次 /state 的内容                │
-│  │   commandQueue    待执行命令队列                        │
-│  │   eventLog        最近 100 条事件                      │
-│  │   actionResults   命令执行结果                         │
-│  │                                                      │
-│  └── 配置                                                │
-│      port: 3001                                         │
-│      pollInterval: 2s (可调)                             │
-│      maxQueueSize: 32                                   │
-└──────────────────────────┬───────────────────────────────┘
-                           │ HTTP (TheSim:QueryServer)
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  DST Mod (Lua, 在游戏进程内运行)                           │
-│                                                          │
-│  ├── modmain.lua    入口：初始化、配置、定时器              │
-│  ├── scripts/                                             │
-│  │   ├── perception.lua 感知：枚举实体、读组件、组装 JSON   │
-│  │   ├── actions.lua    执行：命令 → BufferedAction        │
-│  │   ├── events.lua     监听：游戏事件 → 即时上报          │
-│  │   └── http.lua       通信：TheSim:QueryServer 封装     │
-│  │                                                      │
-│  工作循环 (DoPeriodicTask, 每 2 秒):                      │
-│    1. perception() → 组装状态 JSON                        │
-│    2. POST /state                                        │
-│    3. GET /commands                                      │
-│    4. 对每条命令 → actions.execute(cmd)                   │
-│    5. POST /result                                       │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: Claude (策略层)                                        │
+│  读 SKILL.md 学会 dst 命令，几分钟下一次目标                       │
+│                                                                 │
+│  dst situation          ← "你在哪，在做什么，需要注意什么"          │
+│  dst goal "gather logs 20"  ← 高层目标                            │
+│  dst goal "survive-night"    ← 高层目标                           │
+│  dst goal "build science_machine"                              │
+│  dst interrupt          ← 紧急叫停                               │
+│  dst state / dst nearby  ← 低层调试 (也可以用)                    │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ bash → dst CLI → POST /api/*
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 2: Bridge Server (agent runtime, Node.js, :3002)          │
+│                                                                 │
+│  ├── CLI API (给 Claude, 返回紧凑文本)                            │
+│  │   POST /api/situation   → 汇总状态 + 当前目标 + 进度 + 警报    │
+│  │   POST /api/goal        → 接受高层目标, 分解为 macro-action    │
+│  │   POST /api/interrupt   → 中断当前目标 + 清空队列              │
+│  │   POST /api/state       → 低层状态快照                         │
+│  │   POST /api/nearby      → 低层附近实体                         │
+│  │   POST /api/inventory   → 低层背包                             │
+│  │   POST /api/events      → 低层事件                             │
+│  │   POST /api/status      → bridge 连接状态                      │
+│  │   POST /api/queue       → 命令队列                             │
+│  │   POST /api/do          → 低层直接动作 (调试用)                │
+│  │                                                             │
+│  ├── Macro Executor (确定性行为循环)                              │
+│  │   goal "gather logs 20"                                     │
+│  │     → 循环: 找最近树 → walk_to → chop → pickup → 计数          │
+│  │     → 达标 20: done (通知 Claude)                             │
+│  │     → 失败 (天黑/被攻击/斧头断): interrupt + 通知              │
+│  │     → 中断条件检查: 夜晚来临→暂停→reflex                       │
+│  │                                                             │
+│  ├── Reflex Engine (紧急应变)                                    │
+│  │   事件触发 (attacked/night/hunger_critical/freeze)           │
+│  │     → 优先级 1: 确定性规则 (有火把→装备; 有营火→跑过去)        │
+│  │     → 优先级 2: DeepSeek API (规则搞不定时)                   │
+│  │     → 优先级 3: 通知 Claude (不紧急的情况)                    │
+│  │                                                             │
+│  ├── Command Lifecycle Manager                                  │
+│  │   queued → leased → executing → done/fail/timeout            │
+│  │   lease 超时自动回收 (DST mod 崩了不丢命令)                   │
+│  │   stateSeq 新鲜度检查 (过旧命令拒绝)                          │
+│  │                                                             │
+│  ├── State Cache (in-memory)                                    │
+│  │   currentState    最新一次 /tick 的状态                       │
+│  │   currentGoal     当前高层目标 + 进度                         │
+│  │   commandQueue    待执行低层命令                              │
+│  │   eventLog        最近 100 条事件                            │
+│  │   actionResults   命令执行结果                               │
+│  │                                                             │
+│  ├── DeepSeek Client (应变 LLM)                                 │
+│  │   紧急事件 → 构造 prompt (状态+附近+背包) → 调 API → 解析动作  │
+│  │   system prompt: "你是饥荒生存 AI，快速决策，输出一个 action" │
+│  │                                                             │
+│  └── DST Internal API (给 DST mod, 返回 JSON)                    │
+│      POST /tick          ← 上传状态 + 返回待执行命令 (合并)       │
+│      POST /result        ← 上报命令执行结果 (ack)                │
+│      POST /event         ← 上报即时事件                          │
+│      GET  /config        → 拉取配置                              │
+│                                                             │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ HTTP (TheSim:QueryServer)
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 1: DST Mod (Lua, 在游戏进程内, 尽量傻)                     │
+│                                                                 │
+│  ├── modmain.lua    入口：初始化、定时器                          │
+│  ├── scripts/                                                    │
+│  │   ├── perception.lua 感知：枚举实体、读组件、组装 JSON         │
+│  │   ├── actions.lua    执行：命令 → BufferedAction + 完成判定    │
+│  │   ├── events.lua     监听：游戏事件 → 即时上报                 │
+│  │   └── http.lua       通信：TheSim:QueryServer 封装            │
+│  │                                                             │
+│  工作循环 (DoPeriodicTask, 每 2 秒):                             │
+│    1. perception() → 组装状态 JSON                               │
+│    2. POST /tick (上传状态, 同时拿回命令)                         │
+│    3. 对每条命令 → lease → execute → POST /result (ack)          │
+│                                                                 │
+│  事件 (即时, 不等周期):                                          │
+│    ListenForEvent → POST /event                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **数据流**:
-- DST → Bridge Server: JSON（DST mod 内部组装，结构化）
-- Bridge Server → CLI: **紧凑文本**（省 token 的关键）
-- CLI → Bridge Server: JSON（命令参数）
-- Bridge Server → DST: JSON（命令队列）
-
-Bridge Server 做格式转换：DST 上报的 JSON → CLI 输出的紧凑文本。
+- DST → Bridge: JSON（`POST /tick`，状态+命令合并）
+- Bridge → CLI: **紧凑文本**（省 token）
+- Bridge → DeepSeek: JSON prompt（紧急应变）
+- Bridge → DST: JSON（命令队列，lease 模式）
 
 ---
 
-## 5. `dst` CLI 命令清单
+## 6. `/tick` 协议（合并状态上报 + 命令拉取）
 
-### 5.1 命令总览
+### 6.1 为什么合并
+
+原来是 `POST /state` + `GET /commands` 两次 HTTP。合并成 `POST /tick` 一次完成：
+- 少一次 HTTP 往返
+- 状态和命令绑定同一个 seq，原子性更好
+- lease 过期计算更简单
+
+### 6.2 POST /tick
+
+**Request (DST mod → Bridge):**
+```json
+{
+  "seq": 42,
+  "ts": 1779815359,
+  "playerUserId": "KU_xxx",
+  "state": {
+    "player": {
+      "userid": "KU_xxx", "name": "Wilson", "prefab": "wilson",
+      "health": 150, "maxHealth": 150,
+      "hunger": 120, "maxHunger": 150,
+      "sanity": 180, "maxSanity": 200,
+      "moisture": 0, "temperature": 25,
+      "isFreezing": false, "isOverheating": false,
+      "pos": { "x": 120.5, "y": 0, "z": -340.2 },
+      "facing": 1.57,
+      "isBusy": false, "currentAction": null,
+      "inLight": true, "isGhost": false
+    },
+    "world": {
+      "cycle": 5, "phase": "day", "season": "autumn",
+      "seasonProgress": 0.35, "remainingDaysInSeason": 10,
+      "isRaining": false, "isSnowing": false,
+      "moonPhase": "new", "isCave": false
+    },
+    "nearby": [
+      {
+        "guid": 12345, "prefab": "tree", "name": "Evergreen",
+        "pos": { "x": 125, "y": 0, "z": -335 },
+        "distance": 7.1, "bearing": "front-right",
+        "actions": ["chop"],
+        "state": { "growthStage": "tall", "isBurning": false, "isStump": false }
+      }
+    ],
+    "inventory": [
+      { "slot": 1, "guid": 12350, "prefab": "axe", "name": "Axe",
+        "stackSize": 1, "equipSlot": "hands", "uses": 80, "maxUses": 100 }
+    ],
+    "equipped": {
+      "hands": { "prefab": "axe", "name": "Axe", "uses": 80 },
+      "head": null, "body": null
+    },
+    "recipes": [
+      { "recipe": "campfire", "name": "Campfire", "canBuild": true,
+        "ingredients": [{ "item": "log", "need": 2, "have": 15 }] }
+    ]
+  },
+  "executingResults": [
+    { "id": "cmd-038", "status": "completed", "action": "chop",
+      "result": { "itemsGained": [{ "prefab": "log", "count": 2 }] } }
+  ]
+}
+```
+
+**Response (Bridge → DST mod):**
+```json
+{
+  "ok": true,
+  "ackSeq": 42,
+  "commands": [
+    {
+      "id": "cmd-039",
+      "action": "chop",
+      "targetGuid": 12346,
+      "invObjectGuid": null,
+      "pos": null,
+      "recipe": null,
+      "leaseId": "lease-001",
+      "leaseTimeoutMs": 15000,
+      "stateSeq": 42
+    }
+  ],
+  "config": {
+    "pollInterval": 2.0,
+    "perceptionRadius": 20
+  }
+}
+```
+
+如果队列空：
+```json
+{ "ok": true, "ackSeq": 42, "commands": [] }
+```
+
+### 6.3 playerUserId 贯穿协议
+
+从第一天就在每个请求里带 `playerUserId`，为多玩家/多世界预留：
+
+- `/tick` request 带 `playerUserId`
+- `/api/*` 端点可选带 `playerUserId`（MVP 单玩家用默认）
+- Bridge 内部按 `playerUserId` 隔离状态缓存（MVP 只有一个 slot）
+
+---
+
+## 7. 命令生命周期
+
+### 7.1 状态机
+
+```
+queued ──(DST mod /tick 拉取)──→ leased ──(开始执行)──→ executing
+   │                                 │                       │
+   │                            (lease 超时)              (完成/失败)
+   │                                 ↓                       ↓
+   │                             queued/failed          done/fail
+   │
+   (interrupt/cancel)
+   ↓
+cancelled
+```
+
+### 7.2 Lease 机制
+
+DST mod 从 `/tick` 拿到命令后，命令进入 `leased` 状态。如果 DST mod 在 `leaseTimeoutMs`（默认 15 秒）内没 `POST /result` ack，Bridge 自动将命令标记为 `timeout`（可配置自动回队列或标记失败）。
+
+**防丢**: 如果 DST mod 崩了 / HTTP 回调失败 / 游戏 tick 中断，命令不会丢。超时后 Bridge 可以重新派发或通知上层。
+
+### 7.3 两阶段结果
+
+`PushAction` 只代表"动作被游戏接受"，不代表"砍完树/捡到东西"。结果分两层：
+
+| 阶段 | 含义 | 谁设置 |
+|---|---|---|
+| `accepted` | DST mod 收到命令，开始执行 | DST mod 在 `/tick` 下一个周期报告 |
+| `executing` | 正在执行（走向目标/砍树中） | DST mod |
+| `completed` | 动作完成，附结果 | DST mod |
+| `failed` | 动作失败，附原因 | DST mod |
+| `timeout` | lease 超时 | Bridge |
+
+DST mod 在 `/tick` 的 `executingResults` 字段里上报上一轮命令的状态变化。
+
+### 7.4 stateSeq 新鲜度检查
+
+每条命令带 `stateSeq`（基于哪个状态快照生成的）。Bridge macro-executor 生成命令时记录 seq，DST mod 执行前可选检查：如果游戏状态已经变了太多（比如目标实体已不在附近），可以拒绝执行并上报 `stale_state`。
+
+---
+
+## 8. Reflex Engine（紧急应变）
+
+### 8.1 触发条件
+
+Bridge 收到 DST mod 的 `POST /event` 后，按事件类型检查是否需要 reflex：
+
+| 事件 | Reflex? | 紧急度 |
+|---|---|---|
+| `attacked` | 是 | 高 — 秒级 |
+| `night` | 是 | 高 — 需要光 |
+| `health_critical` (HP<30) | 是 | 高 |
+| `hunger_critical` (hunger<30) | 是 | 中 |
+| `freeze_warning` | 是 | 高 |
+| `overheat_warning` | 是 | 高 |
+| `dusk` | 规则 | 中 — 提醒 Claude |
+| `killed` | 否 | 低 — 记录 |
+| `death` | 特殊 | — 通知 Claude |
+| `boss_nearby` | 规则 | 中 — 提醒 Claude |
+
+### 8.2 应变决策优先级
+
+```
+事件触发
+  ↓
+1. 确定性规则 (即时, 0ms)
+   - night + 手里有 torch → equip torch
+   - night + 附近有 campfire → walk_to campfire
+   - attacked + HP<30 → walk away from attacker
+   - freeze + 附近有 fire → walk_to fire
+   ↓ (规则搞不定)
+2. DeepSeek API (快, ~1-2s)
+   构造 prompt: 状态 + 附近实体 + 背包 + 事件
+   "你是饥荒生存AI，1秒内决策，输出一个action JSON"
+   解析回复 → 排队执行
+   ↓ (DeepSeek 也搞不定或超时)
+3. 通知 Claude (异步)
+   记录事件 + "reflex_failed" → 等下次 dst situation 时 Claude 看到
+```
+
+### 8.3 DeepSeek Reflex Prompt 模板
+
+```
+System: 你是饥荒联机版的生存AI。你必须在1秒内做出一个动作决策。
+只输出一个JSON，不要解释。格式:
+{"action":"walk_to","pos":{"x":0,"z":0}}
+或 {"action":"equip","invObjectGuid":12345}
+或 {"action":"attack","targetGuid":12345}
+或 {"action":"build","recipe":"campfire"}
+
+User: 
+紧急事件: 被蜘蛛攻击，HP 80/150
+当前状态: Day3 Autumn night, 有torch(60u), 有axe(80u equip)
+位置: (120,-340) 在黑暗中
+附近:
+  #999 spider 3m F [atk] hp:50
+  #12351 campfire 5m R [addfuel] fuel:10/180
+  #12352 tree 8m L [chop]
+背包: logx5 cutgrassx3 twigsx2 flintx1
+可选: 装备torch获得光源 / 跑向营火 / 攻击蜘蛛
+```
+
+DeepSeek 回复示例：
+```json
+{"action":"equip","invObjectGuid":<torch GUID>}
+```
+
+Bridge 解析后排队执行，不需要等 Claude。
+
+### 8.4 Reflex 不阻塞 Macro
+
+如果 macro-executor 正在执行 `goal "gather logs 20"`，reflex 触发时：
+1. 暂停 macro（标记 `paused`）
+2. 执行 reflex 动作
+3. reflex 完成后恢复 macro（标记 `resumed`）
+4. 如果 reflex 导致状态大变（如被追杀跑了很远），macro 判定是否需要中断并通知 Claude
+
+---
+
+## 9. Macro-Action 框架
+
+### 9.1 内置 macro-action
+
+| macro | 输入 | 行为循环 | 完成条件 | 中断条件 |
+|---|---|---|---|---|
+| `gather` | prefab, count | 找最近目标→walk→action→pickup→计数 | 达到 count | 天黑/被攻击/材料没了 |
+| `survive_night` | — | 建火/加燃料/待在火旁 | 天亮 | — |
+| `build` | recipe[, pos] | 检查材料→不够则 gather→够了 build | 建造完成 | 材料永远凑不齐 |
+| `craft` | recipe | 同 build（便携物品） | 制作完成 | — |
+| `explore` | direction | 朝方向走→定期检查 nearby | 发现新资源点 | 天黑/危险 |
+| `return_to_base` | — | 走回营火/科学机器位置 | 到达 | 被阻挡 |
+| `fight` | targetGuid | 走向目标→攻击→走位→重复 | 目标死亡 | HP<50 |
+
+### 9.2 Macro Executor 核心逻辑
+
+```javascript
+class MacroExecutor {
+  constructor(stateCache, cmdQueue, reflexEngine) {
+    this.current = null;  // { goal, steps, stepIndex, status, progress }
+  }
+
+  start(goal) {
+    this.current = { goal, status: 'running', progress: {}, steps: this.plan(goal) };
+    this.executeNextStep();
+  }
+
+  executeNextStep() {
+    if (!this.current || this.current.status !== 'running') return;
+    const step = this.current.steps[this.current.stepIndex];
+    if (!step) { this.complete('done'); return; }
+
+    // 检查中断条件
+    if (this.checkInterrupt()) { this.pause(); return; }
+
+    // 生成低层命令
+    const cmd = this.generateCommand(step);
+    cmdQueue.enqueue(cmd);
+    // 等命令完成后继续
+    cmd.onComplete = (result) => this.onStepComplete(step, result);
+  }
+
+  onStepComplete(step, result) {
+    if (result.status === 'completed') {
+      this.updateProgress(step, result);
+      this.current.stepIndex++;
+      this.executeNextStep();
+    } else if (result.status === 'failed') {
+      this.handleStepFailure(step, result);
+    }
+  }
+
+  pause() { this.current.status = 'paused'; }
+  resume() { this.current.status = 'running'; this.executeNextStep(); }
+  interrupt() { this.current = null; cmdQueue.cancelAll(); }
+  complete(status) { /* 通知 Claude */ }
+}
+```
+
+### 9.3 `gather logs 20` 分解示例
+
+```
+goal: gather logs 20
+
+Step 1: check_inventory → logs: 5 → need 15 more
+Step 2: check_equipped → hands: axe ✓
+  (if no axe → sub-goal: craft axe → gather materials → craft → equip)
+Step 3: find_nearest tree → #12345 at 7m
+Step 4: walk_to #12345
+Step 5: chop #12345 → logs +2 → total 7
+Step 6: pickup logs on ground → total 9
+Step 7: find_next tree → #12352 at 10m
+Step 8: walk → chop → pickup → total 11
+...
+Step N: total >= 20 → done! 通知 Claude
+```
+
+如果中间天黑了 → reflex 暂停 macro → 执行 survive_night → 天亮恢复 macro。
+
+---
+
+## 10. `dst` CLI 命令清单
+
+### 10.1 高层命令（给 Claude 策略层用）
 
 ```bash
-dst state              # 一行状态快照
-dst nearby             # 附近实体列表
+dst situation              # 汇总：状态 + 正在做什么 + 进度 + 警报
+dst goal "gather logs 20"  # 下目标：收集20根木头
+dst goal "survive-night"   # 下目标：熬过今晚
+dst goal "build science_machine"
+dst interrupt              # 中断当前目标 + 清空队列
+dst goals                  # 查看当前目标 + 历史
+```
+
+### 10.2 低层命令（调试/精细控制用）
+
+```bash
+dst state              # 状态快照
+dst nearby             # 附近实体
 dst nearby tree        # 只看树
-dst nearby --action chop  # 只看可砍的
+dst nearby --action chop
 dst inv                # 背包 + 装备
 dst events             # 最近事件
 dst events --since 5   # seq 5 之后的事件
-dst chop 12345         # 砍 GUID 12345
-dst mine 12346         # 挖矿
-dst pick 12347         # 采摘
-dst pickup 12348       # 拾取
-dst attack 12349       # 攻击
-dst eat 12350          # 吃
-dst equip 12350        # 装备
-dst unequip hands      # 卸下手部
-dst build campfire     # 建造
-dst build axe          # 制作
-dst walk 200 -300      # 走到坐标
-dst walkto 12345       # 走到实体旁
-dst cook 12350 12351   # 在 12351 上烹饪 12350
-dst addfuel 12352 12353 # 给 12353 加燃料 12352
-dst sleep 12354        # 在 12354 睡觉
-dst cancel             # 取消队列 + 中断当前动作
-dst queue              # 查看命令队列
-dst status             # bridge 连接状态
+dst chop 12345         # 直接砍
+dst walk 200 -300      # 直接走
+dst build campfire     # 直接建
+dst equip 12350        # 直接装备
+dst eat 12351          # 直接吃
+dst cancel             # 清空队列
+dst queue              # 查看队列
+dst status             # bridge 状态
 dst help               # 帮助
 ```
 
-### 5.2 输出格式（紧凑文本，省 token）
+### 10.3 输出格式（紧凑文本）
 
-#### `dst state`
+#### `dst situation`
+```
+=== SITUATION ===
+HP:150/150 Hgr:120/150 San:180/200
+Day5 Autumn dusk(2/12) — NIGHT IN ~2 MIN, BUILD FIRE NOW
+Pos:(120,-340) Light:yes
+
+Goal: gather logs 20
+  Progress: 12/20 logs collected
+  Status: running (chopping tree #12352, 60% done)
+  Next: find next tree after this one
+
+Alerts:
+  ⚠ dusk started — macro will auto-pause for survive-night when night falls
+  ⚠ axe at 20% durability, will break soon
+
+Events (last 60s):
+  [killed] rabbit 30s ago
+  [dusk] phase:day→dusk 10s ago
+```
+
+Claude 看 `dst situation` 就够了，不用 `dst state` + `dst nearby` + `dst events` + `dst queue` 调四遍。**一个命令拿全貌，极省 token。**
+
+#### `dst goal "gather logs 20"`
+```
+✓ goal accepted: gather logs 20
+  current logs: 5, need 15 more
+  plan: find tree → chop → pickup → repeat
+  axe equipped ✓
+  starting execution...
+```
+
+#### `dst goal "survive-night"`
+```
+✓ goal accepted: survive-night
+  phase: dusk (night in ~2 min)
+  plan: build campfire → stay near fire → wait for dawn
+  materials: logx5 cutgrassx8 (campfire needs logx2 cutgrassx3) ✓
+  starting execution...
+```
+
+#### `dst interrupt`
+```
+✓ interrupted: gather logs 20 (was at 12/20)
+  3 queued commands cancelled
+  current action: aborted
+```
+
+#### `dst goals`
+```
+Goals:
+  [active] gather logs 20 — running (12/20)
+  [done]   craft axe — completed 3m ago
+  [failed] explore north — interrupted by night (8m ago)
+```
+
+#### `dst state` (低层，同之前)
 ```
 HP:150/150 Hgr:120/150 San:180/200 Temp:25C Wet:0
 Day5 Autumn dusk(2/12) Moon:new Rain:no Snow:no
-Pos:(120,-340) Light:yes Busy:no Ghost:no
+Pos:(120,-340) Light:yes Busy:yes Ghost:no
 Equip:axe Hands:axe Head:- Body:-
 Inv[8]: axe(80u) logx15 cutgrassx8 flintx3 twigsx2 berriesx5 torch(60u)
 Recipes[can]: campfire torch
 Recipes[need]: axe(+2twigs) spear(+1rope)
 ```
 
-解析：
-- `HP:150/150` — 当前/最大血量
-- `Hgr:120/150` — 饥饿值
-- `San:180/200` — 理智
-- `Temp:25C` — 温度
-- `Wet:0` — 潮湿度
-- `Day5 Autumn dusk(2/12)` — 第5天，秋天，黄昏，当前第2天/共12天
-- `Pos:(120,-340)` — 坐标
-- `Light:yes` — 在光亮中
-- `Busy:no` — 是否正在执行动作
-- `Equip` / `Hands` / `Head` / `Body` — 装备槽
-- `Inv[8]:` — 背包8格，`axe(80u)` = 斧头剩余80耐久，`logx15` = 15个木头
-- `Recipes[can]` — 材料够可以做的
-- `Recipes[need]` — 差一点材料的
-
-#### `dst nearby`
+#### `dst nearby` (低层，同之前)
 ```
 Nearby[15] r=20:
   #12345 tree     7.1m FR  [chop] tall
   #12346 sapling   3.5m FL  [pick] 
   #12347 rabbit   12.0m R   [atk,pickup] 
-  #12348 flint     1.2m F   [pickup] x3
-  #12349 boulder   8.5m BR  [mine] 
-  #12350 spider    9.0m B   [atk] hp:50
   #12351 campfire  2.0m F   [addfuel] fuel:45/180
-```
-
-解析：
-- `#12345` — GUID（动作命令用这个）
-- `tree` — prefab
-- `7.1m` — 距离
-- `FR` — 方位（Front-Right）
-- `[chop]` — 可执行动作
-- `tall` — 实体状态（树的大小）
-
-方位缩写：`F`=前 `B`=后 `L`=左 `R`=右 `FL`=前左 `FR`=前右 `BL`=后左 `BR`=后右
-
-#### `dst nearby tree`
-```
-Nearby[tree] 3 found:
-  #12345 tree     7.1m FR  [chop] tall
-  #12352 tree    10.3m L   [chop] normal
-  #12353 tree    15.2m BL  [chop] short
-```
-
-#### `dst nearby --action chop`
-```
-Nearby[choppable] 4 found:
-  #12345 tree     7.1m FR  [chop] tall
-  #12352 tree    10.3m L   [chop] normal
-  #12353 tree    15.2m BL  [chop] short
-  #12349 boulder  8.5m BR  [mine] 
-```
-
-#### `dst inv`
-```
-Inventory[8/15]:
-  [1] axe       x1  (80/100u)  equip:hands
-  [2] log       x15
-  [3] cutgrass  x8
-  [4] flint     x3
-  [5] twigs     x2
-  [6] berries   x5  fresh:0.8
-  [7] torch     x1  (60/100u)
-  [8] (empty)
-Equipped:
-  hands: axe(80u)
-  head:  -
-  body:  -
-Backpack: (none)
-```
-
-#### `dst events`
-```
-Events[3] last 60s:
-  #1 [attacked] hound dmg:20 hp:150→130  12s ago
-  #2 [killed]   rabbit                     8s ago
-  #3 [dusk]     phase:day→dusk             3s ago
-```
-
-#### `dst events --since 1`
-```
-Events since #1:
-  #2 [killed]   rabbit                     8s ago
-  #3 [dusk]     phase:day→dusk             3s ago
-```
-
-#### `dst chop 12345`
-```
-✓ queued: chop #12345 (tree, 7.1m FR)
-  id=cmd-001 wait~2s for DST to pick up
-```
-
-#### `dst build campfire`
-```
-✓ queued: build campfire at current pos
-  id=cmd-002 materials: logx2 cutgrassx3 (have: 15,8)
-```
-
-#### `dst build campfire 200 -300`
-```
-✓ queued: build campfire at (200,-300)
-  id=cmd-003 materials: logx2 cutgrassx3 (have: 15,8)
-```
-
-#### `dst cancel`
-```
-✓ cancelled 3 queued commands
-  current action: aborted
-```
-
-#### `dst queue`
-```
-Queue[2]:
-  cmd-002 [build campfire]      queued
-  cmd-003 [chop #12345]         executing (walking to target)
-```
-
-#### `dst status`
-```
-Bridge: localhost:3001
-DST:    connected (last state 1s ago)
-Queue:  2 pending, 1 executing
-Uptime: 3600s  cmds processed: 150
-```
-
-DST 未连接时：
-```
-Bridge: localhost:3001
-DST:    NOT CONNECTED (last state 45s ago)
-  → Is the DST mod running? Is the game hosting a world?
 ```
 
 ---
 
-## 6. REST API 协议
+## 11. REST API 协议
 
-### 6.1 DST mod → Bridge Server（内部通信）
+### 11.1 DST mod → Bridge（内部通信，JSON）
 
-这些端点只给 DST mod 用，返回 JSON。
+#### POST /tick
 
-#### POST /state
-
-DST mod 上报当前游戏状态。
-
-**Request (JSON):**
-```json
-{
-  "seq": 42,
-  "ts": 1779815359,
-  "player": {
-    "userid": "KU_xxx",
-    "name": "Wilson",
-    "prefab": "wilson",
-    "health": 150, "maxHealth": 150,
-    "hunger": 120, "maxHunger": 150,
-    "sanity": 180, "maxSanity": 200,
-    "moisture": 0, "temperature": 25,
-    "isFreezing": false, "isOverheating": false,
-    "pos": { "x": 120.5, "y": 0, "z": -340.2 },
-    "facing": 1.57,
-    "isBusy": false, "currentAction": null,
-    "inLight": true, "isGhost": false
-  },
-  "world": {
-    "cycle": 5, "phase": "day", "season": "autumn",
-    "seasonProgress": 0.35, "remainingDaysInSeason": 10,
-    "isRaining": false, "isSnowing": false,
-    "moonPhase": "new", "isCave": false
-  },
-  "nearby": [
-    {
-      "guid": 12345, "prefab": "tree", "name": "Evergreen",
-      "pos": { "x": 125, "y": 0, "z": -335 },
-      "distance": 7.1, "bearing": "front-right",
-      "actions": ["chop"],
-      "state": { "growthStage": "tall", "isBurning": false, "isStump": false }
-    }
-  ],
-  "inventory": [
-    { "slot": 1, "guid": 12350, "prefab": "axe", "name": "Axe",
-      "stackSize": 1, "equipSlot": "hands", "uses": 80, "maxUses": 100 }
-  ],
-  "equipped": {
-    "hands": { "prefab": "axe", "name": "Axe", "uses": 80 },
-    "head": null, "body": null
-  },
-  "recipes": [
-    { "recipe": "campfire", "name": "Campfire", "canBuild": true,
-      "ingredients": [{ "item": "log", "need": 2, "have": 15 }] }
-  ]
-}
-```
-
-**Response:**
-```json
-{ "ok": true, "commandsWaiting": 3 }
-```
-
-#### GET /commands
-
-DST mod 拉取待执行命令，返回队列并清空。
-
-**Response:**
-```json
-{
-  "commands": [
-    { "id": "cmd-001", "action": "chop", "targetGuid": 12345, "invObjectGuid": null, "pos": null, "recipe": null }
-  ]
-}
-```
+见第 6 节。合并状态上报 + 命令拉取。
 
 #### POST /result
 
+DST mod 上报命令最终结果（ack lease）。
+
 **Request:**
 ```json
-{ "id": "cmd-001", "status": "ok", "action": "chop", "result": { "itemsGained": [{ "prefab": "log", "count": 2 }] } }
+{ "id": "cmd-039", "leaseId": "lease-001", "playerUserId": "KU_xxx",
+  "status": "completed", "action": "chop",
+  "result": { "itemsGained": [{ "prefab": "log", "count": 2 }] } }
 ```
 
 失败：
 ```json
-{ "id": "cmd-001", "status": "fail", "reason": "target_not_found", "message": "Entity 12345 no longer exists" }
+{ "id": "cmd-039", "leaseId": "lease-001", "playerUserId": "KU_xxx",
+  "status": "failed", "reason": "target_not_found", "message": "Entity 12346 no longer exists" }
+```
+
+**Response:**
+```json
+{ "ok": true }
 ```
 
 #### POST /event
 
-即时事件（不等 2 秒周期）。
+即时事件（不等 tick 周期）。
 
 ```json
-{ "ts": 1779815359, "kind": "attacked", "data": { "attackerPrefab": "hound", "damage": 20, "healthAfter": 130 } }
+{ "ts": 1779815359, "playerUserId": "KU_xxx",
+  "kind": "attacked",
+  "data": { "attackerPrefab": "hound", "damage": 20, "healthAfter": 130 } }
 ```
 
 事件类型：
 
-| kind | 触发 | data |
-|---|---|---|
-| `attacked` | 被攻击 | attackerPrefab, damage, healthAfter |
-| `killed` | 杀死实体 | targetPrefab |
-| `death` | 玩家死亡 | cause, killerPrefab |
-| `respawn` | 复活 | — |
-| `health_critical` | HP < 30 | health |
-| `hunger_critical` | 饥饿 > 140 | hunger |
-| `sanity_low` | 理智 < 30 | sanity |
-| `dusk` | 黄昏开始 | — |
-| `night` | 夜晚开始 | — |
-| `dawn` | 天亮 | — |
-| `freeze_warning` | 开始冻结 | temperature |
-| `overheat_warning` | 过热 | temperature |
-| `new_recipe` | 解锁配方 | recipe |
-| `boss_nearby` | boss 靠近 | bossPrefab, distance |
+| kind | 触发 | data | Reflex? |
+|---|---|---|---|
+| `attacked` | 被攻击 | attackerPrefab, damage, healthAfter | **是** |
+| `killed` | 杀死实体 | targetPrefab | 否 |
+| `death` | 玩家死亡 | cause, killerPrefab | 通知 Claude |
+| `respawn` | 复活 | — | 否 |
+| `health_critical` | HP < 30 | health | **是** |
+| `hunger_critical` | hunger < 30 | hunger | **是** |
+| `sanity_low` | 理智 < 30 | sanity | 规则提醒 |
+| `dusk` | 黄昏开始 | — | 规则提醒 |
+| `night` | 夜晚开始 | — | **是** |
+| `dawn` | 天亮 | — | 否 |
+| `freeze_warning` | 开始冻结 | temperature | **是** |
+| `overheat_warning` | 过热 | temperature | **是** |
+| `new_recipe` | 解锁配方 | recipe | 否 |
+| `boss_nearby` | boss 靠近 | bossPrefab, distance | 规则提醒 |
+
+> **注意**: DST 中 hunger 越低越危险（0 = 饿死）。`hunger_critical` 触发条件是 `hunger < 30`，不是 `> 140`。
 
 #### GET /config
 
-**Response:**
 ```json
 {
   "pollInterval": 2.0,
   "perceptionRadius": 20,
   "maxNearbyEntities": 30,
-  "enableEvents": true
+  "enableEvents": true,
+  "leaseTimeoutMs": 15000
 }
 ```
 
-### 6.2 CLI → Bridge Server（Claude 用的 API）
+### 11.2 CLI → Bridge（Claude 用的 API，返回紧凑文本）
 
-这些端点返回**紧凑文本**，不是 JSON。CLI 直接输出。
+#### POST /api/situation
+**Input:** `{ "playerUserId": "KU_xxx" }` (可选)
+**Output:** 紧凑文本（见 10.3 的 `dst situation` 输出）
 
-#### POST /api/state
-**Input:** `{}` （空 JSON）
-**Output:** 紧凑文本（见 5.2 的 `dst state` 输出格式）
-
-#### POST /api/nearby
+#### POST /api/goal
 **Input:**
 ```json
-{ "filterPrefab": "tree", "filterAction": null, "maxCount": 20 }
-```
-**Output:** 紧凑文本（见 5.2 的 `dst nearby` 输出格式）
-
-#### POST /api/inventory
-**Input:** `{}`
-**Output:** 紧凑文本（见 5.2 的 `dst inv` 输出格式）
-
-#### POST /api/events
-**Input:**
-```json
-{ "since": 1, "limit": 20 }
-```
-**Output:** 紧凑文本（见 5.2 的 `dst events` 输出格式）
-
-#### POST /api/do
-**Input:**
-```json
-{
-  "action": "chop",
-  "targetGuid": 12345,
-  "invObjectGuid": null,
-  "pos": null,
-  "recipe": null
-}
+{ "goal": "gather logs 20", "playerUserId": "KU_xxx" }
 ```
 **Output:**
 ```
-✓ queued: chop #12345 (tree, 7.1m FR)
-  id=cmd-001 wait~2s for DST to pick up
+✓ goal accepted: gather logs 20
+  ...
 ```
 
-#### POST /api/queue
-**Input:** `{ "action": "list" }` 或 `{ "action": "cancel" }`
-**Output:** 紧凑文本（见 5.2 的 `dst queue` / `dst cancel` 输出格式）
+#### POST /api/interrupt
+**Input:** `{ "playerUserId": "KU_xxx" }`
+**Output:**
+```
+✓ interrupted: gather logs 20 (was at 12/20)
+  ...
+```
 
-#### POST /api/status
-**Input:** `{}`
-**Output:** 紧凑文本（见 5.2 的 `dst status` 输出格式）
+#### POST /api/goals
+**Input:** `{ "playerUserId": "KU_xxx" }`
+**Output:** 紧凑文本（见 10.3 的 `dst goals`）
+
+#### POST /api/state, /api/nearby, /api/inventory, /api/events, /api/status, /api/queue, /api/do
+同之前设计，返回紧凑文本。
 
 ---
 
-## 7. 动作词汇表
+## 12. 动作词汇表
 
-所有动作映射到 DST 的 `BufferedAction`。参考 FAtiMA-DST。
-
-### 7.1 CLI 动作命令 → 内部 action 名
-
-CLI 做了语义化封装，比直接传 action 名更自然：
+### 12.1 CLI 低层动作命令
 
 | CLI 命令 | action | 参数 | 说明 |
 |---|---|---|---|
@@ -532,17 +747,14 @@ CLI 做了语义化封装，比直接传 action 名更自然：
 | `dst harvest GUID` | harvest | targetGuid | 收获 |
 | `dst dig GUID` | dig | targetGuid | 挖掘 |
 | `dst hammer GUID` | hammer | targetGuid | 拆除 |
-| `dst fish GUID` | fish | targetGuid | 钓鱼 |
 | `dst attack GUID` | attack | targetGuid | 攻击 |
 | `dst eat GUID` | eat | targetGuid | 吃 |
 | `dst equip GUID` | equip | invObjectGuid | 装备 |
-| `dst unequip SLOT` | unequip | targetGuid | 卸下（hands/head/body） |
+| `dst unequip SLOT` | unequip | targetGuid | 卸下 |
 | `dst drop GUID` | drop | invObjectGuid | 丢 |
 | `dst build RECIPE [X Z]` | build | recipe, pos? | 建造/制作 |
 | `dst cook INVGUID TARGETGUID` | cook | invObjectGuid, targetGuid | 烹饪 |
-| `dst dry INVGUID TARGETGUID` | dry | invObjectGuid, targetGuid | 晾肉 |
 | `dst addfuel INVGUID TARGETGUID` | addfuel | invObjectGuid, targetGuid | 加燃料 |
-| `dst fertilize INVGUID TARGETGUID` | fertilize | invObjectGuid, targetGuid | 施肥 |
 | `dst light GUID` | light | targetGuid | 点火 |
 | `dst extinguish GUID` | extinguish | targetGuid | 灭火 |
 | `dst sleep GUID` | sleep_in | targetGuid | 睡觉 |
@@ -554,203 +766,95 @@ CLI 做了语义化封装，比直接传 action 名更自然：
 | `dst plant INVGUID TARGETGUID` | plant | invObjectGuid, targetGuid | 种植 |
 | `dst heal INVGUID TARGETGUID` | heal | invObjectGuid, targetGuid | 治疗 |
 | `dst sew INVGUID TARGETGUID` | sew | invObjectGuid, targetGuid | 缝补 |
-| `dst mount GUID` | mount | targetGuid | 骑乘 |
-| `dst rummage GUID` | rummage | targetGuid | 翻容器 |
+| `dst fish GUID` | fish | targetGuid | 钓鱼 |
 | `dst net GUID` | net | targetGuid | 捕虫 |
-| `dst checktrap GUID` | check_trap | targetGuid | 检查陷阱 |
-| `dst resettrap GUID` | reset_trap | targetGuid | 重置陷阱 |
-| `dst bait INVGUID TARGETGUID` | bait | invObjectGuid, targetGuid | 放诱饵 |
-| `dst feed INVGUID TARGETGUID` | feed | invObjectGuid, targetGuid | 喂食 |
-| `dst fill INVGUID TARGETGUID` | fill | invObjectGuid, targetGuid | 装水 |
-| `dst turnon GUID` | turn_on | targetGuid | 开启 |
-| `dst turnoff GUID` | turn_off | targetGuid | 关闭 |
-| `dst upgrade INVGUID TARGETGUID` | upgrade | invObjectGuid, targetGuid | 升级 |
-| `dst cast INVGUID TARGETGUID` | cast_spell | invObjectGuid, targetGuid | 施法 |
+| `dst mount GUID` | mount | targetGuid | 骑乘 |
 
-### 7.2 动作参数格式（内部 JSON）
-
-CLI 转换后的内部格式：
+### 12.2 动作参数格式（内部 JSON）
 
 ```json
 {
+  "id": "cmd-039",
   "action": "chop",
   "targetGuid": 12345,
   "invObjectGuid": null,
   "pos": null,
-  "recipe": null
+  "recipe": null,
+  "leaseId": "lease-001",
+  "leaseTimeoutMs": 15000,
+  "stateSeq": 42
 }
 ```
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `action` | string | 动作名 |
-| `targetGuid` | number \| null | 目标实体 GUID |
-| `invObjectGuid` | number \| null | 背包物品 GUID |
-| `pos` | `{x, z}` \| null | 目标坐标 |
-| `recipe` | string \| null | 配方名（build 用） |
 
 ---
 
-## 8. 状态感知详细 Schema
+## 13. 状态感知 Schema
 
-DST mod 上报到 Bridge Server 的 JSON 结构。Bridge Server 负责转成紧凑文本给 CLI。
+（同之前设计，略缩——完整 schema 见 Git 历史）
 
-### 8.1 player
-
+### player
 ```json
-{
-  "userid": "KU_xxx", "name": "Wilson", "prefab": "wilson",
-  "health": 150, "maxHealth": 150,
-  "hunger": 120, "maxHunger": 150,
-  "sanity": 180, "maxSanity": 200,
-  "moisture": 0, "temperature": 25,
-  "isFreezing": false, "isOverheating": false,
-  "pos": { "x": 120.5, "y": 0, "z": -340.2 },
-  "facing": 1.57,
-  "isBusy": false, "currentAction": null,
-  "inLight": true, "isGhost": false
-}
+{ "userid":"KU_xxx", "name":"Wilson", "prefab":"wilson",
+  "health":150, "maxHealth":150, "hunger":120, "maxHunger":150,
+  "sanity":180, "maxSanity":200, "moisture":0, "temperature":25,
+  "isFreezing":false, "isOverheating":false,
+  "pos":{"x":120.5,"y":0,"z":-340.2}, "facing":1.57,
+  "isBusy":false, "currentAction":null,
+  "inLight":true, "isGhost":false }
 ```
 
-### 8.2 world
-
+### world
 ```json
-{
-  "cycle": 5, "phase": "day", "season": "autumn",
-  "seasonProgress": 0.35, "remainingDaysInSeason": 10,
-  "isRaining": false, "isSnowing": false,
-  "moonPhase": "new", "isCave": false
-}
+{ "cycle":5, "phase":"day", "season":"autumn",
+  "seasonProgress":0.35, "remainingDaysInSeason":10,
+  "isRaining":false, "isSnowing":false,
+  "moonPhase":"new", "isCave":false }
 ```
 
-### 8.3 nearby 实体
-
+### nearby 实体
 ```json
-{
-  "guid": 12345, "prefab": "tree", "name": "Evergreen",
-  "pos": { "x": 125, "y": 0, "z": -335 },
-  "distance": 7.1, "bearing": "front-right",
-  "actions": ["chop"],
-  "state": { "growthStage": "tall", "isBurning": false, "isStump": false }
-}
+{ "guid":12345, "prefab":"tree", "name":"Evergreen",
+  "pos":{"x":125,"y":0,"z":-335},
+  "distance":7.1, "bearing":"front-right",
+  "actions":["chop"],
+  "state":{"growthStage":"tall","isBurning":false,"isStump":false} }
 ```
-
-`bearing`: `front` / `front-left` / `front-right` / `left` / `right` / `behind` / `behind-left` / `behind-right`
 
 `state` 因 prefab 而异：
 
 | prefab 类型 | state 字段 |
 |---|---|
-| tree | growthStage (short/normal/tall), isBurning, isStump |
-| plant (grass/sapling/berry) | picked, isWilted |
-| rock/boulder | workedAmount, maxWork |
+| tree | growthStage, isBurning, isStump |
+| plant | picked, isWilted |
+| rock | workedAmount, maxWork |
 | animal | isSleeping, isFleeing, health |
 | monster | health, isAttacking, targetIsPlayer |
-| building | isOn, fuelLevel, fuelMax (if fueled) |
-| container | isOpen, isFull |
+| building | isOn, fuelLevel, fuelMax |
 | food | freshness (0-1), isSpoiled |
-| item (ground) | stackSize, freshness |
-
-### 8.4 inventory
-
-```json
-[
-  { "slot": 1, "guid": 12350, "prefab": "axe", "name": "Axe",
-    "stackSize": 1, "equipSlot": "hands", "uses": 80, "maxUses": 100,
-    "freshness": null, "isSpoiled": false }
-]
-```
-
-### 8.5 equipped
-
-```json
-{
-  "hands": { "prefab": "axe", "name": "Axe", "uses": 80 },
-  "head": null, "body": null
-}
-```
-
-### 8.6 recipes
-
-只返回可建造 + 接近可建造的：
-
-```json
-[
-  { "recipe": "campfire", "name": "Campfire", "canBuild": true,
-    "ingredients": [{ "item": "log", "need": 2, "have": 15 }] },
-  { "recipe": "axe", "name": "Axe", "canBuild": false,
-    "ingredients": [{ "item": "twigs", "need": 2, "have": 0 }] }
-]
-```
 
 ---
 
-## 9. DST Mod 文件结构
+## 14. DST Mod 文件结构
 
 ```
 dst-bridge/
-├── modinfo.lua          # mod 元数据
-├── modmain.lua          # 入口：加载模块、定时器、事件注册
+├── modinfo.lua
+├── modmain.lua
 ├── scripts/
-│   ├── perception.lua   # 感知：枚举实体、读组件、组装 JSON
-│   ├── actions.lua      # 执行：命令 → BufferedAction
-│   ├── events.lua       # 监听：游戏事件 → 即时上报
-│   └── http.lua         # 通信：TheSim:QueryServer 封装
+│   ├── perception.lua
+│   ├── actions.lua
+│   ├── events.lua
+│   └── http.lua
 ```
 
-### 9.1 modinfo.lua
-
-```lua
-name = "DST Bridge"
-description = "AI Bridge - lets an external AI agent play DST via CLI"
-author = "royola"
-version = "0.1.0"
-api_version = 10
-
-dst_compatible = true
-dont_starve_compatible = false
-reign_of_giants_compatible = false
-all_clients_require_mod = false
-client_only_mod = false
-
-configuration_options = {
-    {
-        name = "bridge_url",
-        label = "Bridge Server URL",
-        options = { {description = "localhost:3001", data = "http://127.0.0.1:3001"} },
-        default = "http://127.0.0.1:3001",
-    },
-    {
-        name = "poll_interval",
-        label = "Poll Interval (seconds)",
-        options = {
-            {description = "1s", data = 1}, {description = "2s", data = 2},
-            {description = "3s", data = 3}, {description = "5s", data = 5},
-        },
-        default = 2,
-    },
-    {
-        name = "perception_radius",
-        label = "Perception Radius",
-        options = { {description = "15", data = 15}, {description = "20", data = 20}, {description = "30", data = 30} },
-        default = 20,
-    },
-    {
-        name = "agent_userid",
-        label = "Agent Player Userid",
-        options = { {description = "auto (first player)", data = ""} },
-        default = "",
-    },
-}
-```
-
-### 9.2 modmain.lua 核心逻辑
+### 14.1 modmain.lua 核心逻辑（修正版）
 
 ```lua
 local _G = GLOBAL
 local BRIDGE_URL = GetModConfigData("bridge_url")
 local POLL_INTERVAL = GetModConfigData("poll_interval")
 local PERCEPTION_RADIUS = GetModConfigData("perception_radius")
+local AGENT_USERID = GetModConfigData("agent_userid")
 
 if not _G.TheNet:GetIsServer() then return end
 
@@ -761,496 +865,697 @@ local Http = require("http")
 
 local seq = 0
 local agentPlayer = nil
+local eventsRegistered = false
 
 local function FindAgentPlayer()
-    -- 配置了 userid 找对应玩家，否则用第一个
+    if AGENT_USERID ~= "" then
+        for _, v in ipairs(_G.TheNet:GetClientTable()) do
+            if v.userid == AGENT_USERID then
+                return _G.ThePlayer or nil  -- 需要通过 userid 找实体
+            end
+        end
+    end
+    -- 默认用第一个玩家
+    for _, v in ipairs(_G.TheNet:GetClientTable()) do
+        return v.userid
+    end
 end
 
 local function Tick()
     if not agentPlayer then
         agentPlayer = FindAgentPlayer()
         if not agentPlayer then return end
+        -- ⬇ 修正: 找到玩家后才注册事件
+        if not eventsRegistered then
+            Events.Register(agentPlayer, BRIDGE_URL)
+            eventsRegistered = true
+        end
     end
 
     seq = seq + 1
     local state = Perception.Snapshot(agentPlayer, PERCEPTION_RADIUS)
-    state.seq = seq
-    state.ts = _G.GetTime()
+    local tickData = {
+        seq = seq,
+        ts = _G.GetTime(),
+        playerUserId = agentPlayer.userid,
+        state = state,
+        executingResults = Actions.GetPendingResults(),
+    }
 
-    Http.Post(BRIDGE_URL .. "/state", state, function()
-        Http.Get(BRIDGE_URL .. "/commands", function(cmdResp)
-            for _, cmd in ipairs(cmdResp.commands or {}) do
-                local result = Actions.Execute(agentPlayer, cmd)
-                Http.Post(BRIDGE_URL .. "/result", result)
-            end
-        end)
+    -- 合并: 上传状态 + 拿命令 (一次 HTTP)
+    Http.Post(BRIDGE_URL .. "/tick", tickData, function(resp)
+        for _, cmd in ipairs(resp.commands or {}) do
+            Actions.Execute(agentPlayer, cmd)  -- lease → execute
+        end
     end)
 end
-
-Events.Register(agentPlayer, BRIDGE_URL)
 
 AddPrefabPostInit("world", function(inst)
     inst:DoPeriodicTask(POLL_INTERVAL, Tick)
 end)
 ```
 
-### 9.3 actions.lua 核心
+> **修正**: `Events.Register` 移到 `FindAgentPlayer()` 成功之后，不再在 agentPlayer 为 nil 时注册。
+
+### 14.2 actions.lua 核心逻辑（修正版）
 
 ```lua
 local Actions = {}
-
 local ACTION_MAP = {
     chop = _G.ACTIONS.CHOP, mine = _G.ACTIONS.MINE,
     pick = _G.ACTIONS.PICK, pickup = _G.ACTIONS.PICKUP,
     harvest = _G.ACTIONS.HARVEST, dig = _G.ACTIONS.DIG,
-    hammer = _G.ACTIONS.HAMMER, attack = _G.ACTIONS.ATTACK,
-    eat = _G.ACTIONS.EAT, equip = _G.ACTIONS.EQUIP,
-    -- ... 完整映射见动作词汇表
+    attack = _G.ACTIONS.ATTACK, eat = _G.ACTIONS.EAT,
+    equip = _G.ACTIONS.EQUIP, build = _G.ACTIONS.BUILD,
+    -- ... 完整映射
 }
+
+local pendingResults = {}
 
 function Actions.Execute(player, cmd)
     local action = ACTION_MAP[cmd.action]
     if not action then
-        return { id = cmd.id, status = "fail", reason = "unknown_action" }
+        Actions.ReportResult(cmd, "failed", "unknown_action")
+        return
     end
 
     local target = cmd.targetGuid and _G.Ents[cmd.targetGuid]
     local invObject = cmd.invObjectGuid and _G.Ents[cmd.invObjectGuid]
     local pos = cmd.pos and _G.Vector3(cmd.pos.x, 0, cmd.pos.z)
 
-    if cmd.action == "walk_to" then
-        return Actions.WalkTo(player, pos, cmd.id)
-    end
-    if cmd.action == "build" then
-        return Actions.Build(player, cmd.recipe, pos, cmd.id)
+    if cmd.targetGuid and not target then
+        Actions.ReportResult(cmd, "failed", "target_not_found")
+        return
     end
 
+    -- 特殊处理
+    if cmd.action == "walk_to" then
+        Actions.WalkTo(player, pos, cmd)
+        return
+    end
+    if cmd.action == "build" then
+        Actions.Build(player, cmd.recipe, pos, cmd)
+        return
+    end
+
+    -- 通用 BufferedAction
     local ba = _G.BufferedAction(player, target, action, invObject, pos, cmd.recipe)
+
+    -- ⬇ 修正: 只报 accepted, 不报 completed
+    -- completed/failed 在动作真正结束后的回调里报
     player.components.locomotor:PushAction(ba, true)
-    return { id = cmd.id, status = "ok", action = cmd.action }
+
+    -- 记录待跟踪的命令
+    table.insert(pendingResults, {
+        id = cmd.id,
+        leaseId = cmd.leaseId,
+        action = cmd.action,
+        status = "accepted",
+        startTime = _G.GetTime(),
+    })
+
+    -- 监听动作完成 (通过 stategraph 事件或定时检查)
+    player:DoTaskInTime(0.5, function()
+        Actions.CheckCompletion(player, cmd)
+    end)
+end
+
+function Actions.ReportResult(cmd, status, reason, result)
+    -- 在下一个 tick 的 executingResults 里带上
+    table.insert(pendingResults, {
+        id = cmd.id,
+        leaseId = cmd.leaseId,
+        status = status,
+        reason = reason,
+        result = result,
+    })
+end
+
+function Actions.GetPendingResults()
+    local results = pendingResults
+    pendingResults = {}
+    return results
+end
+
+function Actions.CheckCompletion(player, cmd)
+    -- 检查玩家是否还在执行这个动作
+    -- 如果 isBusy=false 且动作相关状态变了 → completed
+    -- 超时检查 → 如果超过 leaseTimeoutMs → timeout
+    -- 这部分需要根据 DST 的 stategraph 具体实现
 end
 ```
 
+> **修正**: `PushAction` 后不再直接返回 `ok`，而是跟踪动作直到 `completed`/`failed`，通过下一个 tick 的 `executingResults` 上报。
+
 ---
 
-## 10. Bridge Server 结构
+## 15. Bridge Server 结构
 
-### 10.1 文件布局
+### 15.1 文件布局
 
 ```
 dst-bridge-server/
 ├── package.json
 ├── src/
-│   ├── index.js       # 入口：HTTP server
-│   ├── dstRoutes.js   # DST mod 端点 (/state, /commands, /result, /event)
-│   ├── cliRoutes.js   # CLI 端点 (/api/*) — 负责格式化紧凑文本
-│   ├── format.js      # JSON → 紧凑文本 格式化函数
-│   ├── state.js       # 状态缓存
-│   ├── queue.js       # 命令队列
-│   └── config.js      # 配置
+│   ├── index.js         # 入口：HTTP server
+│   ├── dstRoutes.js     # DST mod 端点 (/tick, /result, /event, /config)
+│   ├── cliRoutes.js     # CLI 端点 (/api/*) — 紧凑文本
+│   ├── format.js        # JSON → 紧凑文本
+│   ├── state.js         # 状态缓存 (按 playerUserId 隔离)
+│   ├── queue.js         # 命令队列 + lease 生命周期
+│   ├── macro.js         # Macro Executor
+│   ├── reflex.js        # Reflex Engine + DeepSeek 调用
+│   ├── deepseek.js      # DeepSeek API 客户端
+│   └── config.js        # 配置
 ```
 
-### 10.2 技术栈
+### 15.2 技术栈
 
 - Node.js 18+
-- 原生 `http` 模块（无需 Express，跟 Disco Engine 一样轻量）
+- 原生 `http` 模块
+- DeepSeek API（`fetch` 调用，无需额外 SDK）
 - 无需数据库（纯内存）
 - 无需 MCP SDK
 
-### 10.3 format.js — 紧凑文本格式化（省 token 的核心）
+### 15.3 queue.js — 命令生命周期
 
 ```javascript
-function formatState(state) {
-  if (!state) return 'DST: NOT CONNECTED';
-  const p = state.player, w = state.world;
-  return [
-    `HP:${p.health}/${p.maxHealth} Hgr:${p.hunger}/${p.maxHunger} San:${p.sanity}/${p.maxSanity} Temp:${p.temperature}C Wet:${p.moisture}`,
-    `Day${w.cycle} ${w.season} ${w.phase}(${w.remainingDaysInSeason}/${12}) Moon:${w.moonPhase} Rain:${w.isRaining?'yes':'no'}`,
-    `Pos:(${Math.round(p.pos.x)},${Math.round(p.pos.z)}) Light:${p.inLight?'yes':'no'} Busy:${p.isBusy?'yes':'no'} Ghost:${p.isGhost?'yes':'no'}`,
-    `Equip:${p.equipped?.hands?.prefab||'-'} Head:${p.equipped?.head?.prefab||'-'} Body:${p.equipped?.body?.prefab||'-'}`,
-    formatInventory(state.inventory),
-    formatRecipes(state.recipes),
-  ].join('\n');
-}
+class CommandQueue {
+  constructor() {
+    this.commands = new Map();  // id → command + state
+    this.order = [];            // queued 命令的执行顺序
+    this.leases = new Map();    // leaseId → commandId
+    this.maxSize = 32;
+    this.leaseTimeoutMs = 15000;
+  }
 
-function formatNearby(entities, filter) {
-  let list = entities;
-  if (filter?.prefab) list = list.filter(e => e.prefab === filter.prefab);
-  if (filter?.action) list = list.filter(e => e.actions.includes(filter.action));
-  list = list.slice(0, filter?.maxCount || 20);
-  const bearingShort = { 'front':'F','front-left':'FL','front-right':'FR','left':'L','right':'R','behind':'B','behind-left':'BL','behind-right':'BR' };
-  const lines = list.map(e =>
-    `  #${e.guid} ${e.prefab.padEnd(10)} ${e.distance.toFixed(1)}m ${bearingShort[e.bearing]||'?'}  [${e.actions.join(',')}] ${formatEntityState(e)}`
-  );
-  return `Nearby[${filter?.prefab || filter?.action || 'all'}] ${list.length} found:\n` + lines.join('\n');
-}
+  enqueue(command) {
+    if (this.order.length >= this.maxSize) throw new Error('Queue full');
+    const cmd = { ...command, status: 'queued', enqueuedAt: Date.now() };
+    this.commands.set(cmd.id, cmd);
+    this.order.push(cmd.id);
+    return cmd.id;
+  }
 
-function formatInventory(inv) {
-  const items = inv.map(i => {
-    const uses = i.uses != null ? `(${i.uses}u)` : '';
-    const stack = i.stackSize > 1 ? `x${i.stackSize}` : '';
-    const fresh = i.freshness != null && i.freshness < 1 ? ` fresh:${i.freshness.toFixed(1)}` : '';
-    return `  [${i.slot}] ${i.prefab.padEnd(10)} ${stack}${uses}${fresh}`;
-  });
-  return `Inv[${inv.length}]:\n` + items.join('\n');
-}
+  // DST mod /tick 拉取: lease 一批命令
+  leaseBatch(maxCount) {
+    const leased = [];
+    for (const id of this.order.splice(0, maxCount)) {
+      const cmd = this.commands.get(id);
+      if (cmd) {
+        cmd.status = 'leased';
+        cmd.leaseId = 'lease-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+        cmd.leasedAt = Date.now();
+        cmd.leaseTimeoutMs = this.leaseTimeoutMs;
+        this.leases.set(cmd.leaseId, id);
+        leased.push(cmd);
+      }
+    }
+    return leased;
+  }
 
-// ... 其他格式化函数
+  // DST mod /result: ack 结果
+  ack(commandId, leaseId, status, reason, result) {
+    const cmd = this.commands.get(commandId);
+    if (!cmd) return;
+    cmd.status = status;  // completed / failed
+    cmd.reason = reason;
+    cmd.result = result;
+    cmd.completedAt = Date.now();
+    this.leases.delete(leaseId);
+    // 通知 macro executor
+    if (cmd.onComplete) cmd.onComplete(cmd);
+  }
+
+  // 定时检查 lease 超时
+  checkTimeouts() {
+    const now = Date.now();
+    for (const [leaseId, cmdId] of this.leases) {
+      const cmd = this.commands.get(cmdId);
+      if (cmd && now - cmd.leasedAt > cmd.leaseTimeoutMs) {
+        cmd.status = 'timeout';
+        this.leases.delete(leaseId);
+        if (cmd.onComplete) cmd.onComplete(cmd);
+        // 可选: 重新入队
+      }
+    }
+  }
+
+  cancelAll() {
+    const cancelled = [];
+    for (const id of this.order) {
+      const cmd = this.commands.get(id);
+      if (cmd) { cmd.status = 'cancelled'; cancelled.push(id); }
+    }
+    this.order = [];
+    return cancelled;
+  }
+
+  getQueueInfo() {
+    return [...this.commands.values()]
+      .filter(c => ['queued','leased','executing'].includes(c.status))
+      .map(c => ({ id: c.id, action: c.action, status: c.status }));
+  }
+}
 ```
 
-### 10.4 state.js + queue.js
+### 15.4 reflex.js — Reflex Engine
 
-跟之前一样，纯内存缓存。见前版设计文档 9.3/9.4。
+```javascript
+const { callDeepSeek } = require('./deepseek');
+
+class ReflexEngine {
+  constructor(stateCache, cmdQueue, macroExecutor) {
+    this.stateCache = stateCache;
+    this.cmdQueue = cmdQueue;
+    this.macro = macroExecutor;
+    this.reflexLog = [];
+  }
+
+  async handleEvent(event) {
+    const rules = this.matchRules(event);
+    if (rules.deterministic) {
+      // 优先级 1: 确定性规则
+      for (const cmd of rules.deterministic) {
+        this.cmdQueue.enqueue(cmd);
+      }
+      this.log(event.kind, 'rule', rules.deterministic);
+    } else if (rules.needLLM) {
+      // 优先级 2: DeepSeek
+      this.macro.pause();
+      try {
+        const action = await callDeepSeek(this.buildPrompt(event));
+        if (action) {
+          this.cmdQueue.enqueue(action);
+          this.log(event.kind, 'deepseek', action);
+        }
+      } catch (e) {
+        this.log(event.kind, 'deepseek_failed', e.message);
+      }
+      this.macro.resume();
+    } else {
+      // 优先级 3: 只记录, 等下次 situation 时 Claude 看到
+      this.log(event.kind, 'notified', null);
+    }
+  }
+
+  matchRules(event) {
+    const s = this.stateCache.current;
+    if (!s) return {};
+
+    switch (event.kind) {
+      case 'night':
+        // 有 torch → equip
+        const torch = s.inventory?.find(i => i.prefab === 'torch');
+        if (torch) return { deterministic: [{ action: 'equip', invObjectGuid: torch.guid }] };
+        // 附近有 campfire → walk to it
+        const fire = s.nearby?.find(e => e.prefab === 'campfire');
+        if (fire) return { deterministic: [{ action: 'walk_to_entity', targetGuid: fire.guid }] };
+        // 都没有 → 需要 DeepSeek
+        return { needLLM: true };
+
+      case 'attacked':
+        if (s.player.health < 30) {
+          // HP 低 → 逃跑
+          return { needLLM: true };  // 需要判断往哪跑
+        }
+        return { needLLM: true };  // 让 DeepSeek 决定打还是跑
+
+      case 'hunger_critical':
+        const food = s.inventory?.find(i => i.actions?.includes('eat'));
+        if (food) return { deterministic: [{ action: 'eat', targetGuid: food.guid }] };
+        return { needLLM: true };
+
+      case 'freeze_warning':
+        const heat = s.nearby?.find(e => e.prefab === 'campfire' || e.prefab === 'firepit');
+        if (heat) return { deterministic: [{ action: 'walk_to_entity', targetGuid: heat.guid }] };
+        return { needLLM: true };
+
+      default:
+        return {};
+    }
+  }
+
+  buildPrompt(event) {
+    const s = this.stateCache.current;
+    return {
+      system: '你是饥荒联机版的生存AI。1秒内做出一个动作决策。只输出JSON。',
+      user: `事件: ${event.kind} ${JSON.stringify(event.data)}\n状态: ${JSON.stringify(s.player)}\n附近: ${JSON.stringify(s.nearby?.slice(0, 5))}\n背包: ${JSON.stringify(s.inventory)}`,
+    };
+  }
+
+  log(kind, source, data) {
+    this.reflexLog.push({ ts: Date.now(), kind, source, data });
+  }
+}
+```
+
+### 15.5 deepseek.js
+
+```javascript
+const DEEPSEEK_URL = process.env.DEEPSEEK_URL || 'https://api.deepseek.com/v1/chat/completions';
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY || '';
+
+async function callDeepSeek({ system, user }) {
+  if (!DEEPSEEK_KEY) return null;  // 没配置 key 就跳过
+  const res = await fetch(DEEPSEEK_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${DEEPSEEK_KEY}` },
+    body: JSON.stringify({
+      model: 'deepseek-chat',
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      max_tokens: 200,
+      temperature: 0.3,
+    }),
+  });
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content || '';
+  // 尝试解析 JSON action
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+module.exports = { callDeepSeek };
+```
+
+### 15.6 format.js — 紧凑文本（省 token 核心）
+
+```javascript
+function formatSituation(state, goal, events, alerts) {
+  if (!state) return 'DST: NOT CONNECTED';
+  const p = state.player, w = state.world;
+  const lines = [
+    '=== SITUATION ===',
+    `HP:${p.health}/${p.maxHealth} Hgr:${p.hunger}/${p.maxHunger} San:${p.sanity}/${p.maxSanity}`,
+    `Day${w.cycle} ${w.season} ${w.phase}(${w.remainingDaysInSeason}/12)${alerts.phaseWarning || ''}`,
+    `Pos:(${Math.round(p.pos.x)},${Math.round(p.pos.z)}) Light:${p.inLight?'yes':'no'}`,
+  ];
+  if (goal) {
+    lines.push('', `Goal: ${goal.name}`, `  Progress: ${goal.progress}`, `  Status: ${goal.status}`);
+  }
+  if (alerts.items.length) {
+    lines.push('', 'Alerts:');
+    alerts.items.forEach(a => lines.push(`  ${a}`));
+  }
+  if (events.length) {
+    lines.push('', `Events (last 60s):`);
+    events.forEach(e => lines.push(`  [${e.kind}] ${e.summary}`));
+  }
+  return lines.join('\n');
+}
+
+// ... formatState, formatNearby, formatInventory 同之前
+```
 
 ---
 
-## 11. `dst` CLI 脚本
-
-参考 Disco Engine 的 `disco` 脚本，Node.js 单文件。
+## 16. `dst` CLI 脚本
 
 ```
 skills/dst-bridge/
-├── SKILL.md            # 教 Claude 用 dst 命令 + 饥荒生存策略
+├── SKILL.md
 └── scripts/
-    └── dst             # CLI 脚本 (Node.js, 无 shebang 依赖)
+    └── dst
 ```
 
-### 11.1 dst CLI 核心逻辑
+### 16.1 CLI 高层命令
 
 ```javascript
-#!/usr/bin/env node
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
+// 在之前 CLI 基础上新增高层命令
 
-const CONFIG_FILE = path.join(os.homedir(), ".dst-bridge.json");
-const DEFAULT_SERVER = "http://127.0.0.1:3001";
+async situation() {
+  console.log(await callApi("situation", {}));
+},
 
-function getServer() {
-  try { const c = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8")); return c.server || DEFAULT_SERVER; }
-  catch { return DEFAULT_SERVER; }
-}
+async goal(args) {
+  const goalText = args.join(' ');
+  console.log(await callApi("goal", { goal: goalText }));
+},
 
-async function callApi(tool, args = {}) {
-  const server = getServer();
-  const res = await fetch(`${server}/api/${tool}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(args),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(text);
-  return text;
-}
+async interrupt() {
+  console.log(await callApi("interrupt", {}));
+},
 
-const commands = {
-  async state() { console.log(await callApi("state")); },
-  async nearby(args) {
-    const opts = {};
-    const first = args[0];
-    if (first && first.startsWith("--action")) opts.filterAction = args[1];
-    else if (first && !first.startsWith("-")) opts.filterPrefab = first;
-    console.log(await callApi("nearby", opts));
-  },
-  async inv() { console.log(await callApi("inventory")); },
-  async events(args) {
-    const opts = {};
-    if (args[0] === "--since") opts.since = parseInt(args[1]);
-    console.log(await callApi("events", opts));
-  },
-
-  async chop(args) { console.log(await callApi("do", { action: "chop", targetGuid: parseInt(args[0]) })); },
-  async mine(args) { console.log(await callApi("do", { action: "mine", targetGuid: parseInt(args[0]) })); },
-  async pick(args) { console.log(await callApi("do", { action: "pick", targetGuid: parseInt(args[0]) })); },
-  async pickup(args) { console.log(await callApi("do", { action: "pickup", targetGuid: parseInt(args[0]) })); },
-  async harvest(args) { console.log(await callApi("do", { action: "harvest", targetGuid: parseInt(args[0]) })); },
-  async attack(args) { console.log(await callApi("do", { action: "attack", targetGuid: parseInt(args[0]) })); },
-  async eat(args) { console.log(await callApi("do", { action: "eat", targetGuid: parseInt(args[0]) })); },
-  async equip(args) { console.log(await callApi("do", { action: "equip", invObjectGuid: parseInt(args[0]) })); },
-  async unequip(args) { console.log(await callApi("do", { action: "unequip", targetGuid: args[0] })); },
-  async drop(args) { console.log(await callApi("do", { action: "drop", invObjectGuid: parseInt(args[0]) })); },
-
-  async build(args) {
-    const recipe = args[0];
-    const pos = args[1] && args[2] ? { x: parseFloat(args[1]), z: parseFloat(args[2]) } : null;
-    console.log(await callApi("do", { action: "build", recipe, pos }));
-  },
-  async walk(args) {
-    console.log(await callApi("do", { action: "walk_to", pos: { x: parseFloat(args[0]), z: parseFloat(args[1]) } }));
-  },
-  async walkto(args) {
-    console.log(await callApi("do", { action: "walk_to_entity", targetGuid: parseInt(args[0]) }));
-  },
-  async cook(args) {
-    console.log(await callApi("do", { action: "cook", invObjectGuid: parseInt(args[0]), targetGuid: parseInt(args[1]) }));
-  },
-  async addfuel(args) {
-    console.log(await callApi("do", { action: "addfuel", invObjectGuid: parseInt(args[0]), targetGuid: parseInt(args[1]) }));
-  },
-  async sleep(args) { console.log(await callApi("do", { action: "sleep_in", targetGuid: parseInt(args[0]) })); },
-  async light(args) { console.log(await callApi("do", { action: "light", targetGuid: parseInt(args[0]) })); },
-  async activate(args) { console.log(await callApi("do", { action: "activate", targetGuid: parseInt(args[0]) })); },
-
-  async cancel() { console.log(await callApi("queue", { action: "cancel" })); },
-  async queue() { console.log(await callApi("queue", { action: "list" })); },
-  async status() { console.log(await callApi("status")); },
-
-  async server(args) {
-    if (args[0]) {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify({ server: args[0] }));
-      console.log(`Server set to ${args[0]}`);
-    } else {
-      console.log(`Server: ${getServer()}`);
-    }
-  },
-
-  async help() {
-    console.log(`
-dst — play Don't Starve Together via AI bridge
-
-  dst state                 Current state (HP/hunger/sanity/season/pos/inventory)
-  dst nearby [prefab]       Nearby entities (filter: dst nearby tree)
-    --action ACTION          Filter by action: dst nearby --action chop
-  dst inv                   Inventory + equipment
-  dst events [--since N]    Recent events
-  dst queue                 View command queue
-  dst cancel                Cancel all queued + abort current action
-  dst status                Bridge connection status
-
-Actions (target by GUID from 'dst nearby'):
-  dst chop GUID             dst mine GUID        dst pick GUID
-  dst pickup GUID           dst harvest GUID     dst dig GUID
-  dst hammer GUID           dst attack GUID      dst eat GUID
-  dst equip GUID            dst unequip hands    dst drop GUID
-  dst build RECIPE [X Z]    dst cook INVGUID TARGETGUID
-  dst walk X Z              dst walkto GUID      dst sleep GUID
-  dst addfuel INVGUID TARGETGUID
-  dst light GUID            dst activate GUID    dst extinguish GUID
-
-Setup:
-  dst server [URL]          Set/get bridge server URL (default: localhost:3001)
-  dst help                  This message
-
-Server: ${getServer()}
-`);
-  },
-};
-
-async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
-  if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") { await commands.help(); return; }
-  const fn = commands[cmd];
-  if (!fn) { console.error(`Unknown: ${cmd}. Run 'dst help'.`); process.exit(1); }
-  try { await fn(args); } catch (e) { console.error(`Error: ${e.message}`); process.exit(1); }
-}
-main();
+async goals() {
+  console.log(await callApi("goals", {}));
+},
 ```
 
 ---
 
-## 12. SKILL.md — 饥荒生存策略
+## 17. SKILL.md — 饥荒生存策略
 
 ```markdown
 ---
 name: dst-bridge
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   description: >-
-    Play Don't Starve Together as an AI survivor. Gather resources, craft tools,
-    build a base, survive the night, and don't starve. Use this skill whenever
-    the user mentions Don't Starve Together, DST, 饥荒, or wants an AI to play
-    a survival game.
+    Play Don't Starve Together as an AI survivor. Give high-level goals via
+    `dst goal`, check situation via `dst situation`, let the bridge handle
+    micro-execution and emergency reflexes. Use when the user mentions
+    Don't Starve Together, DST, 饥荒, or wants AI to play a survival game.
 ---
 
 # Don't Starve Together · 饥荒联机版
 
-You are an AI playing Don't Starve Together. You survive by gathering resources,
-crafting tools, building shelter, and making it through each night.
+You are an AI playing Don't Starve Together. You give high-level goals;
+the bridge server handles micro-execution (walking, chopping, picking up)
+and emergency reflexes (night, attacks, low health).
 
 ## How to play
 
-The game runs locally. You interact via the `dst` CLI.
-
-### The main loop
+### The main loop: situation → goal → wait → situation
 
 ```bash
-dst state          # read current situation
-dst nearby         # see what's around you
-dst chop 12345     # do something
-dst state          # check what changed
+dst situation              # what's happening? what should I worry about?
+dst goal "gather logs 20"  # give a goal
+dst situation              # check progress + new alerts
+dst goal "build campfire"  # next goal
 ```
 
-**Read → Decide → Act → Read again.** The game is real-time, so things change
-between your commands. Always check state before acting.
+You DON'T need to micromanage. The bridge handles:
+- Finding the nearest tree, walking to it, chopping, picking up logs
+- Equipping tools automatically
+- Emergency actions at night / under attack (via DeepSeek reflex)
 
-### Starting a new game
+You DO need to decide:
+- What to gather and in what order
+- When to build vs explore
+- Whether to fight or flee (for non-emergencies)
+- Long-term strategy (seasons, base location, tech tree)
 
-First days priority:
-1. `dst nearby --action pick` — find grass, twigs, flint
-2. `dst pick <GUID>` — gather cutgrass and twigs (need 3 grass + 3 twigs for axe)
-3. `dst build axe` — craft an axe
-4. `dst equip <GUID>` — equip the axe
-5. `dst nearby tree` — find trees
-6. `dst chop <GUID>` — chop trees for logs
-7. Before dusk: `dst build campfire` — you NEED light at night
+### High-level commands
 
-### Survival priorities (highest first)
+```bash
+dst situation              # Full picture: state + current goal + alerts
+dst goal "gather logs 20"  # Collect 20 logs (auto: find→chop→pickup→count)
+dst goal "gather twigs 10"
+dst goal "gather flint 5"
+dst goal "gather grass 15"
+dst goal "craft axe"       # Make an axe (auto: check mats→gather→craft)
+dst goal "build campfire"  # Build campfire at current position
+dst goal "build science_machine"
+dst goal "survive-night"   # Stay alive until dawn
+dst goal "explore north"   # Walk north, report what you find
+dst interrupt              # Stop current goal, cancel all actions
+dst goals                  # See current + past goals
+```
 
-1. **Night is coming** → you MUST have a fire before dark, or you die
-   - Check `dst state` for phase. If `dusk`, build a fire NOW
-   - `dst build campfire` at your current position
-2. **Health < 30** → find food or healing
-   - `dst nearby --action eat` or `dst nearby berries`
-   - `dst eat <GUID>`
-3. **Hunger > 130** → find food immediately
-   - Berries, carrots, rabbits, cooked food
-4. **Sanity < 30** → pick flowers, sleep, or eat cooked food
-5. **Freezing** → build a fire, get warm
-6. **Under attack** → fight back or run
-   - `dst attack <GUID>` to fight
-   - `dst walk <X> <Z>` to flee
+### Low-level commands (for debugging)
+
+```bash
+dst state                  # Raw state snapshot
+dst nearby                 # What's around me
+dst nearby tree            # Just trees
+dst inv                    # Inventory
+dst events                 # Recent events
+dst chop 12345             # Direct action by GUID
+dst walk 200 -300          # Walk to coordinates
+dst cancel                 # Clear command queue
+```
+
+### Starting a new game (first 5 days)
+
+```bash
+# Day 1: basics
+dst goal "gather grass 15"     # need grass for everything
+dst goal "gather twigs 10"     # need twigs for tools
+dst goal "gather flint 5"      # need flint for tools
+dst goal "craft axe"           # first tool!
+dst goal "gather logs 20"      # wood for building
+dst goal "build campfire"      # SURVIVE THE NIGHT
+
+# Day 2-3: science + tools
+dst goal "craft pickaxe"       # mine rocks
+dst goal "gather rocks 15"
+dst goal "gather gold 5"       # need gold for science machine
+dst goal "build science_machine"  # unlock better recipes
+dst goal "craft spear"         # weapon
+dst goal "craft backpack"      # more inventory space
+
+# Day 4-5: base
+dst goal "build firepit"       # permanent fire
+dst goal "gather logs 30"      # stockpile
+dst goal "explore north"       # find resources
+```
+
+### Survival priorities
+
+1. **Night is coming** → bridge auto-handles emergency light, but you should
+   plan ahead. If `dst situation` shows dusk, make sure you have a goal to
+   build/be near fire.
+2. **Health < 30** → bridge reflex will try to help, but you should
+   `dst goal "gather food"` or find healing items
+3. **Hunger < 30** → eat food! `dst situation` will warn you
+4. **Sanity < 30** → pick flowers, sleep, eat cooked food
+5. **Season change coming** → prepare (winter = warm clothes, summer = cooling)
 
 ### Day/night cycle
 
-- **Day**: gather resources, explore, build
-- **Dusk**: prepare for night — build/fuel fire, eat, craft
-- **Night**: stay near fire, plan next day, cook food
-- Phases show in `dst state` output: `Day5 Autumn dusk(2/12)`
+- **Day**: gather, explore, build
+- **Dusk**: bridge will warn you — start wrapping up
+- **Night**: bridge reflex activates (auto light/fire). You plan next day.
+- `dst situation` shows phase + time warning
 
 ### Seasons
 
-- **Autumn** (default start): mild, do everything
-- **Winter**: freezing, need warm clothes, food scarce, build thermal stone
-- **Spring**: lots of rain, need raincoat/umbrella, lightning
-- **Summer**: overheating, wildfires, need ice cream/thermal stone
-
-### Key recipes (early game)
-
-| Recipe | Materials | Priority |
-|---|---|---|
-| axe | 1 flint + 2 twigs | First — need to chop trees |
-| pickaxe | 2 flint + 2 twigs | Second — need to mine rocks |
-| campfire | 2 logs + 3 cutgrass | Every night |
-| torch | 2 cutgrass + 2 logs | Emergency light |
-| spear | 1 rope + 1 flint + 2 twigs | Combat |
-| backpack | 4 twigs + 6 cutgrass + 1 rope | More inventory |
-| science machine | 1 log + 1 gold + 4 stone | Unlock better recipes |
-| rope | 3 cutgrass | Crafting material |
+- **Autumn** (start): mild, do everything
+- **Winter**: freezing, food scarce — `dst goal "craft winterhat"`, stockpile food
+- **Spring**: rain — `dst goal "craft rainhat"`, watch for lightning
+- **Summer**: heat — stay near cooling sources, watch for wildfires
 
 ### Tips
 
-- **Always check `dst state` before acting** — your situation changes in real-time
-- **GUIDs change** — entities might disappear between commands, check `dst nearby` again
-- **Night kills** — Charlie (the night monster) attacks in darkness. Always have light.
-- **Don't starve** — keep hunger below 100. Cook food at a fire for more hunger restoration.
-- **Save materials** — don't waste logs on unnecessary things early on
-- **Explore** — `dst walk X Z` to move around, then `dst nearby` to find new resources
+- **Use `dst situation` as your main command** — it gives you everything in one call
+- **Give goals, not micro-commands** — `dst goal "gather logs 20"` not 20x `dst chop`
+- **Check situation after each goal completes** — things change in real-time
+- **Trust the reflex engine** — if you're attacked at night, bridge handles it
+- **Interrupt when needed** — `dst interrupt` if a goal is going badly
+- **GUIDs are for low-level commands only** — goals handle targeting automatically
 
 ### Error handling
 
-- `target_not_found` — entity disappeared, check `dst nearby` for fresh GUIDs
-- `DST: NOT CONNECTED` — game not running or mod not loaded
-- Command stuck in `executing` — action taking time (walking long distance), use `dst cancel` if needed
+- `goal failed: no trees nearby` → explore first: `dst goal "explore north"`
+- `goal interrupted: night fell` → bridge auto-paused, will resume at dawn or you can `dst goal "survive-night"`
+- `DST: NOT CONNECTED` → game not running or mod not loaded
 ```
 
 ---
 
-## 13. 安全边界
+## 18. 安全边界
 
-### 13.1 Bridge Server 只允许 localhost
+### 18.1 Bridge Server 只允许 localhost
 
 ```javascript
-server.listen(3001, '127.0.0.1');
+server.listen(3002, '127.0.0.1');
 ```
 
-### 13.2 命令白名单
+### 18.2 命令白名单
 
-DST mod 只接受预定义的 action 名（ACTION_MAP），不接受任意 Lua 代码。
+DST mod 只接受 ACTION_MAP 里的 action 名，不接受任意 Lua。
 
-### 13.3 不暴露 shell
+### 18.3 不暴露 shell
 
-CLI 只提供结构化动作命令，不提供 `execute_lua` / `run_command` / `eval`。
+CLI 只提供结构化动作/goal，不提供 `execute_lua` / `eval`。
 
-### 13.4 远程访问（可选未来）
+### 18.4 DeepSeek API Key 安全
 
-如果需要从 VPS 远程控制本地 DST：
-- Tailscale / ZeroTier / SSH 隧道
-- 或参考 Slay Bridge 的 relay 架构
+```bash
+# 通过环境变量传入，不写进代码
+DEEPSEEK_API_KEY=sk-xxx node src/index.js
+```
+
+### 18.5 远程访问（可选）
+
+Tailscale / SSH 隧道，不直接暴露端口。
 
 ---
 
-## 14. 开发计划
+## 19. 开发计划
 
-### Phase 1: MVP — 能感知 + 能砍树 (3 天)
+### Phase 1: 低层闭环 — 感知 + 执行 + CLI (3 天)
 
-1. **DST Mod 基础** (1 天)
+**目标**: `dst state` → `dst nearby` → `dst chop 12345` 能跑通
+
+1. **DST Mod** (1.5 天)
    - modinfo.lua + modmain.lua + http.lua
-   - 基础感知 (player 状态 + nearby 实体)
-   - 定时上报状态到 Bridge Server
+   - perception.lua: player 状态 + nearby 实体
+   - POST /tick 上报状态
+   - actions.lua: chop + walk_to + pickup (带 lease + 两阶段结果)
+   - events.lua: 基础事件 (attacked/dusk/night)
 
-2. **Bridge Server 基础** (1 天)
-   - REST endpoints (POST /state, GET /commands, POST /result)
-   - 状态缓存
-   - /api/* 端点 + format.js 紧凑文本格式化
+2. **Bridge Server** (1 天)
+   - POST /tick + POST /result + POST /event
+   - state.js 状态缓存
+   - queue.js 命令队列 + lease 生命周期
+   - /api/* 端点 + format.js 紧凑文本
+   - lease 超时检查
 
-3. **CLI + 动作执行** (1 天)
-   - dst CLI 脚本 (state, nearby, chop, walk)
-   - actions.lua: chop + walk_to + pickup
-   - SKILL.md
-   - 端到端联调：`dst state` → `dst nearby` → `dst chop 12345`
+3. **CLI + SKILL.md** (0.5 天)
+   - dst CLI: state, nearby, inv, events, chop, walk, build, cancel, status
+   - SKILL.md 基础版
 
-### Phase 2: 完整动作 + 事件 (2 天)
+### Phase 2: Macro-Action + 高层命令 (2 天)
 
-4. **完整动作词汇表** (1 天)
-   - 所有 50+ 动作
-   - build / equip / eat / cook 等
-   - CLI 命令完善
+4. **Macro Executor** (1 天)
+   - macro.js: goal → plan → step → execute → track → complete
+   - 内置 macro: gather, craft, build, survive_night
+   - /api/goal, /api/situation, /api/interrupt
+   - CLI: dst goal, dst situation, dst interrupt, dst goals
 
-5. **事件系统** (1 天)
-   - events.lua: 受伤/击杀/死亡/昼夜切换
-   - POST /event → /api/events
-   - `dst events` 命令
+5. **完善低层动作** (1 天)
+   - 补全 30+ 动作映射
+   - actions.lua 完成判定 (stategraph 检查)
+   - 错误恢复 (卡住/目标消失)
 
-### Phase 3: 生存策略 + 优化 (2 天)
+### Phase 3: Reflex Engine + DeepSeek (2 天)
 
-6. **SKILL.md 完善** (1 天)
-   - 饥荒生存知识库
-   - 决策循环模板
-   - 自动生存策略
+6. **Reflex Engine** (1 天)
+   - reflex.js: 事件匹配 → 确定性规则 → DeepSeek → 通知
+   - deepseek.js: API 客户端
+   - 紧急规则: night/attacked/hunger_critical/freeze
+   - macro 暂停/恢复联动
 
-7. **优化** (1 天)
+7. **联调 + 优化** (1 天)
+   - 端到端: Claude → dst goal → macro → reflex → DST
+   - SKILL.md 完善 (生存策略知识库)
    - 感知半径动态调整
-   - 命令队列优先级
-   - 错误恢复
-   - 多 player 支持
+   - playerUserId 多玩家预留
 
 ### 总计: ~1 周
 
+> MVP 优先级：**先低层闭环（Phase 1），再高层目标（Phase 2），最后应变（Phase 3）**。
+> Phase 1 结束就能 `dst chop` 砍树。Phase 2 结束就能 `dst goal "gather logs 20"`。Phase 3 结束夜里不怕死。
+
 ---
 
-## 15. 与 Disco Engine 的关系
+## 20. 与 Disco Engine 的关系
 
-| 组件 | Disco Engine | DST Bridge |
+| 组件 | Disco Engine | DST Agent Runtime |
 |---|---|---|
-| 接口层 | REST API + MCP + CLI | **REST API + CLI** (MCP 以后加) |
-| CLI 脚本 | `disco` (Node.js) | `dst` (Node.js, 同构) |
+| 定位 | 文字游戏引擎 | **实时游戏 agent runtime** |
+| 接口层 | REST + MCP + CLI | REST + CLI (MCP 以后加) |
+| CLI | `disco` | `dst` (同构) |
 | SKILL.md | 游戏知识 + CLI 用法 | 生存策略 + CLI 用法 |
 | 状态来源 | SQLite ROM | DST mod 实时感知 |
 | 动作执行 | 引擎解释器 | DST BufferedAction |
-| 多 player | token = playerId | userid = playerId |
-| 输出格式 | 紧凑文本 | 紧凑文本（同理念） |
+| 决策层 | LLM 直接操作 | **LLM 策略 + DeepSeek 应变 + 确定性执行** |
+| 输出格式 | 紧凑文本 | 紧凑文本 |
 
-**未来愿景**: Disco Engine 模式成为通用"AI 玩游戏"范式 — 文字游戏用 ROM，饥荒用 DST mod，其他游戏写对应适配层。CLI + REST + SKILL.md 三件套不变，AI agent 不需要知道底层差异。
+**未来愿景**: "AI 玩游戏"通用范式 — CLI + REST + SKILL.md 不变，各游戏写适配层。DST 是第一个实时游戏适配，验证三层架构（策略/应变/执行）。
 
 ---
 
-## 16. 已知风险和缓解
+## 21. 已知风险和缓解
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| DST 更新破坏 mod API | mod 不可用 | 锁定 DST 版本，mod 做版本检查 |
-| TheSim:QueryServer 不稳定 | 通信中断 | 加重试 + 超时，失败不崩溃 |
-| 实体 GUID 不稳定 | 命令找不到目标 | 每次状态上报刷新 GUID，命令用最新 GUID |
-| LLM 决策太慢 | 角色站着不动 | 命令队列预填多个动作 |
-| 角色卡住 | 无法继续 | 超时检测 + 自动 cancel + 重新感知 |
-| 夜晚没火 | 角色死亡 | 事件系统 dusk 告警 + SKILL.md 强调 |
+| DST 更新破坏 mod API | mod 不可用 | 锁定版本，mod 做版本检查 |
+| TheSim:QueryServer 不稳定 | 通信中断 | 重试 + 超时，失败不崩溃 |
+| 实体 GUID 不稳定 | 命令找不到目标 | stateSeq 新鲜度检查，macro 自动重新找目标 |
+| LLM 决策太慢 | 角色站着不动 | macro-action 预填队列，reflex 秒级应变 |
+| 角色卡住 | 无法继续 | lease 超时 + 自动 cancel + macro 重新规划 |
+| 夜晚没火 | 角色死亡 | reflex night 事件 → 自动找火/装备火把 |
+| DeepSeek API 不可用 | reflex 降级 | 回退到确定性规则，通知 Claude |
+| VPS 内存不够 | OOM | 1GB swap 已加，不开洞穴，最小世界 |
+| 命令丢了 | 动作没执行 | lease 机制 + 超时回收 + stateSeq 检查 |
