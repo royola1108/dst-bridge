@@ -542,7 +542,23 @@ dst goals                  # 查看当前目标 + 历史
 
 ### 10.1.1 `dst wait` — 阻塞等待
 
-Claude Code 是请求-响应模型，不能真正"挂起"等异步推送。`dst wait` 用长轮询模拟：CLI 阻塞，Bridge 有结果时立即返回。
+`dst wait` 本身是阻塞的——它等 goal 有终态才返回。但 Claude Code **不应该阻塞调用它**，而应该用 `run_in_background` 后台跑：
+
+```bash
+# ❌ 阻塞调用 — Claude 干等，什么都做不了
+dst goal "gather logs 20"
+dst wait                    # Claude 卡在这里 45 秒
+
+# ✅ 后台调用 — Claude 继续聊天/钓鱼，完了自动通知
+# bash run_in_background=true
+dst goal "gather logs 20" && dst wait
+# Claude 继续跟你说话、写日记、钓鱼
+# ...
+# 砍完了/出事了 → <task-notification> 自动弹出来
+# Claude 看到通知再决策
+```
+
+`dst goal` + `dst wait` 用 `&&` 串起来放后台，效果等同于"派跑腿的"：goal 在 Bridge 里执行，wait 在后台阻塞等结果，Claude 前台自由活动。结果到了 Claude Code 自动推 `<task-notification>`。
 
 **触发返回的条件**（任一满足即返回）：
 
@@ -573,20 +589,26 @@ current situation:
 suggested next: dst goal "survive-night" or dst goal "gather logs 20" to resume
 ```
 
-**Bridge 实现**：`/api/wait` 长轮询（SSE 或内部轮询），最长等待 `timeout` 秒，有结果立即响应。无 goal 在执行时返回 `no active goal`。
+**Bridge 实现**：`/api/wait` 长轮询（内部 200ms 检查），最长等待 `timeout` 秒，有结果立即响应。无 goal 在执行时返回 `no active goal`。HTTP 连接断开不影响 goal 执行。
 
-**Claude 的自然循环**：
+**Claude 的自然循环（后台模式）**：
 ```
-dst goal "gather logs 20"     → ✓ goal accepted
-dst wait                       → (阻塞 45s) → interrupted: attacked
-dst situation                  → 看当前状态
-dst goal "survive-night"       → 重新规划
-dst wait                       → (阻塞 2min) → done: dawn arrived
-dst goal "gather logs 20"      → 继续未完成的
-dst wait                       → (阻塞 30s) → done: 20 logs
+# 后台启动 goal
+dst goal "gather logs 20" && dst wait    # run_in_background=true
+
+# Claude 继续跟你聊天、分析代码、写东西
+# ...
+
+# <task-notification> 弹出:
+#   "interrupted: attacked by hound, reflex fled to campfire"
+# Claude 看到通知 → dst situation → dst goal "survive-night" && dst wait (后台)
+# 继续聊天
+# <task-notification>: "done: dawn arrived"
+# Claude → dst goal "gather logs 20" && dst wait (后台)
+# ...
 ```
 
-不用轮询，不用 SSE 推送，Claude 自然地"等-响应"循环。DeepSeek reflex 该处理处理了，等 `dst wait` 返回时 Claude 第一时间知道发生了什么。
+砍树在后台，聊天在前台，出事了通知弹出来切过去处理。
 
 ### 10.2 低层命令（调试/精细控制用）
 
@@ -1447,25 +1469,36 @@ and emergency reflexes (night, attacks, low health).
 
 ## How to play
 
-### The main loop: situation → goal → wait → situation
+### The main loop: goal → wait (background) → react → repeat
 
 ```bash
-dst situation              # what's happening? what should I worry about?
-dst goal "gather logs 20"  # give a goal
-dst wait                   # block until goal completes/fails/gets interrupted
-dst situation              # check what changed, plan next
+# Start a goal in the background — it runs while you keep talking to me
+# bash run_in_background=true
+dst goal "gather logs 20" && dst wait
+
+# I continue chatting with you, writing, analyzing — no blocking
+# ...
+
+# <task-notification> pops up automatically when the goal finishes or gets interrupted:
+#   "done: 20 logs collected"  OR  "interrupted: attacked, reflex fled to campfire"
+
+# I see the notification → check situation → give next goal
+dst situation              # what's the full picture now?
 dst goal "build campfire"  # next goal
-dst wait                   # block until done
+# bash run_in_background=true
+dst goal "build campfire" && dst wait
 ```
 
-`dst wait` is the key command. It blocks until something happens:
+**Key insight**: `dst goal` + `dst wait` chained with `&&` and run in background = "dispatch a runner".
+The goal executes in Bridge, wait blocks in background, I stay free in foreground.
+When something happens, Claude Code pushes a `<task-notification>` automatically.
+
+`dst wait` returns when:
 - Goal completed → `done: 20 logs collected`
 - Goal failed → `failed: no trees nearby`
 - Reflex interrupted → `interrupted: attacked by hound, reflex fled to campfire`
 - Player died → `emergency: player died`
 - Timeout (default 120s) → `still running, use 'dst wait' again`
-
-This means you don't need to poll. Give a goal, wait, react to the result.
 
 You DON'T need to micromanage. The bridge handles:
 - Finding the nearest tree, walking to it, chopping, picking up logs
