@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+// dst — CLI for the DST Bridge Agent Runtime.
+// Talks to Bridge Server via REST API. Outputs compact text.
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const CONFIG_FILE = path.join(os.homedir(), ".dst-bridge.json");
+const DEFAULT_SERVER = "http://127.0.0.1:3002";
+
+function getServer() {
+  try {
+    const c = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    return c.server || DEFAULT_SERVER;
+  } catch {
+    return DEFAULT_SERVER;
+  }
+}
+
+async function callApi(tool, args = {}) {
+  const server = getServer();
+  const res = await fetch(`${server}/api/${tool}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text);
+  return text;
+}
+
+function parseGuid(s) {
+  const n = parseInt(s, 10);
+  if (isNaN(n)) { console.error(`Invalid GUID: ${s}`); process.exit(1); }
+  return n;
+}
+
+const commands = {
+  // ─── Low-level: state ───
+  async state() { console.log(await callApi("state")); },
+
+  async nearby(args) {
+    const opts = {};
+    const first = args[0];
+    if (first && first.startsWith("--action")) { opts.filterAction = args[1]; }
+    else if (first && !first.startsWith("-")) { opts.filterPrefab = first; }
+    console.log(await callApi("nearby", opts));
+  },
+
+  async inv() { console.log(await callApi("inventory")); },
+  async inventory() { console.log(await callApi("inventory")); },
+
+  async events(args) {
+    const opts = {};
+    if (args[0] === "--since") opts.since = parseInt(args[1], 10);
+    console.log(await callApi("events", opts));
+  },
+
+  async status() { console.log(await callApi("status")); },
+  async queue() { console.log(await callApi("queue")); },
+
+  // ─── Low-level: actions ───
+  async chop(args) { console.log(await callApi("do", { action: "chop", targetGuid: parseGuid(args[0]) })); },
+  async mine(args) { console.log(await callApi("do", { action: "mine", targetGuid: parseGuid(args[0]) })); },
+  async pick(args) { console.log(await callApi("do", { action: "pick", targetGuid: parseGuid(args[0]) })); },
+  async pickup(args) { console.log(await callApi("do", { action: "pickup", targetGuid: parseGuid(args[0]) })); },
+  async harvest(args) { console.log(await callApi("do", { action: "harvest", targetGuid: parseGuid(args[0]) })); },
+  async dig(args) { console.log(await callApi("do", { action: "dig", targetGuid: parseGuid(args[0]) })); },
+  async hammer(args) { console.log(await callApi("do", { action: "hammer", targetGuid: parseGuid(args[0]) })); },
+  async attack(args) { console.log(await callApi("do", { action: "attack", targetGuid: parseGuid(args[0]) })); },
+  async eat(args) { console.log(await callApi("do", { action: "eat", targetGuid: parseGuid(args[0]) })); },
+  async equip(args) { console.log(await callApi("do", { action: "equip", invObjectGuid: parseGuid(args[0]) })); },
+  async unequip(args) { console.log(await callApi("do", { action: "unequip", targetGuid: args[0] })); },
+  async drop(args) { console.log(await callApi("do", { action: "drop", invObjectGuid: parseGuid(args[0]) })); },
+  async fish(args) { console.log(await callApi("do", { action: "fish", targetGuid: parseGuid(args[0]) })); },
+  async net(args) { console.log(await callApi("do", { action: "net", targetGuid: parseGuid(args[0]) })); },
+  async light(args) { console.log(await callApi("do", { action: "light", targetGuid: parseGuid(args[0]) })); },
+  async extinguish(args) { console.log(await callApi("do", { action: "extinguish", targetGuid: parseGuid(args[0]) })); },
+  async activate(args) { console.log(await callApi("do", { action: "activate", targetGuid: parseGuid(args[0]) })); },
+  async jumpin(args) { console.log(await callApi("do", { action: "jump_in", targetGuid: parseGuid(args[0]) })); },
+  async sleep(args) { console.log(await callApi("do", { action: "sleep_in", targetGuid: parseGuid(args[0]) })); },
+  async rummage(args) { console.log(await callApi("do", { action: "rummage", targetGuid: parseGuid(args[0]) })); },
+  async mount(args) { console.log(await callApi("do", { action: "mount", targetGuid: parseGuid(args[0]) })); },
+
+  async build(args) {
+    const recipe = args[0];
+    if (!recipe) { console.error("Usage: dst build RECIPE [X Z]"); process.exit(1); }
+    const pos = args[1] && args[2] ? { x: parseFloat(args[1]), z: parseFloat(args[2]) } : null;
+    console.log(await callApi("do", { action: "build", recipe, pos }));
+  },
+
+  async walk(args) {
+    if (!args[0] || !args[1]) { console.error("Usage: dst walk X Z"); process.exit(1); }
+    console.log(await callApi("do", { action: "walk_to", pos: { x: parseFloat(args[0]), z: parseFloat(args[1]) } }));
+  },
+
+  async walkto(args) {
+    console.log(await callApi("do", { action: "walk_to_entity", targetGuid: parseGuid(args[0]) }));
+  },
+
+  async cook(args) {
+    console.log(await callApi("do", { action: "cook", invObjectGuid: parseGuid(args[0]), targetGuid: parseGuid(args[1]) }));
+  },
+
+  async addfuel(args) {
+    console.log(await callApi("do", { action: "addfuel", invObjectGuid: parseGuid(args[0]), targetGuid: parseGuid(args[1]) }));
+  },
+
+  async give(args) {
+    console.log(await callApi("do", { action: "give", invObjectGuid: parseGuid(args[0]), targetGuid: parseGuid(args[1]) }));
+  },
+
+  async store(args) {
+    console.log(await callApi("do", { action: "store", invObjectGuid: parseGuid(args[0]), targetGuid: parseGuid(args[1]) }));
+  },
+
+  // ─── Queue management ───
+  async cancel() { console.log(await callApi("cancel")); },
+  async interrupt() { console.log(await callApi("cancel")); },
+
+  // ─── Config ───
+  async server(args) {
+    if (args[0]) {
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify({ server: args[0] }));
+      console.log(`Server set to ${args[0]}`);
+    } else {
+      console.log(`Server: ${getServer()}`);
+    }
+  },
+
+  // ─── Help ───
+  async help() {
+    console.log(`
+dst — play Don't Starve Together via AI bridge
+
+  dst state                 Current state (HP/hunger/sanity/season/pos/inventory)
+  dst nearby [prefab]       Nearby entities (filter: dst nearby tree)
+    --action ACTION          Filter by action: dst nearby --action chop
+  dst inv                   Inventory + equipment
+  dst events [--since N]    Recent events
+  dst queue                 View command queue
+  dst cancel                Cancel all queued + abort current action
+  dst status                Bridge connection status
+
+Actions (target by GUID from 'dst nearby'):
+  dst chop GUID             dst mine GUID        dst pick GUID
+  dst pickup GUID           dst harvest GUID     dst dig GUID
+  dst hammer GUID           dst attack GUID      dst eat GUID
+  dst equip GUID            dst unequip hands    dst drop GUID
+  dst build RECIPE [X Z]    dst cook INVGUID TARGETGUID
+  dst walk X Z              dst walkto GUID      dst sleep GUID
+  dst addfuel INVGUID TARGETGUID
+  dst light GUID            dst activate GUID    dst extinguish GUID
+  dst fish GUID             dst net GUID         dst mount GUID
+  dst jumpin GUID           dst rummage GUID
+
+Setup:
+  dst server [URL]          Set/get bridge server URL (default: localhost:3002)
+  dst help                  This message
+
+Server: ${getServer()}
+`);
+  },
+};
+
+async function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
+    await commands.help();
+    return;
+  }
+  const fn = commands[cmd];
+  if (!fn) {
+    console.error(`Unknown: ${cmd}. Run 'dst help'.`);
+    process.exit(1);
+  }
+  try {
+    await fn(args);
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+main();
