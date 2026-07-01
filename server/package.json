@@ -1,0 +1,12 @@
+{
+  "name": "dst-bridge-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent runtime for Don't Starve Together AI bridge",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {}
+}
