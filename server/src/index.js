@@ -23,9 +23,18 @@ export function createServer() {
   setInterval(() => queue.cleanup(), 60000);
 
   async function readBody(req) {
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    return body ? JSON.parse(body) : {};
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString("utf8");
+    if (!body) return {};
+    try {
+      // DST's json.encode escapes single quotes as \' which is invalid JSON
+      const fixed = body.replace(/\\'/g, "'");
+      return JSON.parse(fixed);
+    } catch (e) {
+      console.error("[bridge] JSON parse error:", e.message, "body[:200]:", body.slice(0, 200));
+      throw e;
+    }
   }
 
   function sendJson(res, code, data) {
@@ -54,6 +63,7 @@ export function createServer() {
       // ─── DST Mod endpoints ───
       if (path === "/tick" && method === "POST") {
         const body = await readBody(req);
+        console.log("[bridge] /tick received, playerUserId:", body.playerUserId, "seq:", body.seq);
         const puid = body.playerUserId || "default";
         stateCache.update(puid, body.seq, body.state);
 
@@ -211,4 +221,10 @@ export function createServer() {
       return srv;
     },
   };
+}
+
+// Auto-start when run directly (node src/index.js)
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const s = createServer();
+  s.listen();
 }

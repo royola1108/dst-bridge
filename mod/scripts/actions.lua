@@ -1,11 +1,10 @@
 -- actions.lua — command → BufferedAction execution + completion tracking
 -- References: FAtiMA-DST fatimabrain.lua BufferedAction + AddFailAction/AddSuccessAction
 
-local _G = GLOBAL
-local ACTIONS = _G.ACTIONS
-local BufferedAction = _G.BufferedAction
-local Ents = _G.Ents
-local Vector3 = _G.Vector3
+local ACTIONS = ACTIONS
+local BufferedAction = BufferedAction
+local Ents = Ents
+local Vector3 = Vector3
 
 local Actions = {}
 
@@ -116,7 +115,7 @@ function Actions.Build(player, recipeName, pos, cmd)
         return
     end
 
-    local recipe = _G.AllRecipes[recipeName]
+    local recipe = AllRecipes[recipeName]
     if not recipe then
         ReportResult(cmd, "failed", "unknown_recipe", { recipe = recipeName })
         return

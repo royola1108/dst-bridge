@@ -7,10 +7,10 @@ local AGENT_USERID = GetModConfigData("agent_userid")
 -- Only run on server
 if not _G.TheNet:GetIsServer() then return end
 
-local Http = require("http")
-local Perception = require("perception")
-local Actions = require("actions")
-local Events = require("events")
+local Http = require("bridge_http")
+local Perception = require("bridge_perception")
+local Actions = require("bridge_actions")
+local Events = require("bridge_events")
 
 local seq = 0
 local agentPlayer = nil
@@ -73,8 +73,10 @@ local function Tick()
         state = state,
         executingResults = executingResults,
     })
+    print("[dst-bridge] tick " .. seq .. " json encoded, posting to " .. BRIDGE_URL .. "/tick")
 
     Http.Post(BRIDGE_URL .. "/tick", tickData, function(responseText, success, code)
+        print("[dst-bridge] tick " .. seq .. " response: success=" .. tostring(success) .. " code=" .. tostring(code))
         if not success or code ~= 200 then return end
 
         local resp = _G.json.decode(responseText)

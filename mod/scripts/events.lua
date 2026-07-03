@@ -1,18 +1,17 @@
 -- events.lua — listen for game events → POST /event to bridge
 -- References: FAtiMA-DST fatimabrain.lua event listeners
 
-local _G = GLOBAL
 local Events = {}
 
 function Events.Register(player, bridgeUrl, playerUserId)
     local function postEvent(kind, data)
-        local eventData = _G.json.encode({
-            ts = _G.GetTime(),
+        local eventData = json.encode({
+            ts = GetTime(),
             playerUserId = playerUserId,
             kind = kind,
             data = data,
         })
-        _G.TheSim:QueryServer(
+        TheSim:QueryServer(
             bridgeUrl .. "/event",
             function() end,
             "POST",

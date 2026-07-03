@@ -1,11 +1,10 @@
 -- perception.lua — gather game state into a JSON-serializable table
 -- References: FAtiMA-DST fatimabrain.lua Entity() + Perceptions()
 
-local _G = GLOBAL
-local MathAbs = _G.math.abs
-local MathAtan2 = _G.math.atan
-local MathSqrt = _G.math.sqrt
-local MathFloor = _G.math.floor
+local MathAbs = math.abs
+local MathAtan2 = math.atan
+local MathSqrt = math.sqrt
+local MathFloor = math.floor
 
 local Perception = {}
 
@@ -95,7 +94,7 @@ local function AvailableActions(ent, player)
 end
 
 -- Entity-specific state
-local function EntityState(ent)
+local function EntityState(ent, player)
     local s = {}
 
     -- Tree growth
@@ -117,8 +116,8 @@ local function EntityState(ent)
 
     -- Fuel level
     if ent:HasTag("BURNABLE_fueled") and ent.components.fueled then
-        s.fuelLevel = MathFloor(ent.components.fueled:GetCurrentSection() or 0)
-        s.fuelMax = MathFloor(ent.components.fueled:GetMaxSections() or 0)
+        s.fuelLevel = MathFloor(ent.components.fueled.currentfuel or 0)
+        s.fuelMax = MathFloor(ent.components.fueled.maxfuel or 0)
     end
 
     -- Health (for creatures/monsters)
@@ -164,7 +163,7 @@ function Perception.NearbyEntities(player, radius)
     local TAGS = nil
     local EXCLUDE_TAGS = {"INLIMBO", "NOCLICK", "CLASSIFIED", "FX", "player"}
     local ONE_OF_TAGS = nil
-    local ents = _G.TheSim:FindEntities(px, py, pz, radius, TAGS, EXCLUDE_TAGS, ONE_OF_TAGS)
+    local ents = TheSim:FindEntities(px, py, pz, radius, TAGS, EXCLUDE_TAGS, ONE_OF_TAGS)
 
     local result = {}
     for _, ent in ipairs(ents) do
@@ -182,7 +181,7 @@ function Perception.NearbyEntities(player, radius)
                     distance = MathFloor(dist * 10) / 10,
                     bearing = CalcBearing(player, { x = ex, y = ey, z = ez }),
                     actions = actions,
-                    state = EntityState(ent),
+                    state = EntityState(ent, player),
                 })
             end
         end
@@ -217,10 +216,10 @@ function Perception.PlayerState(player)
         maxHunger = hunger and MathFloor(hunger.max) or 0,
         sanity = sanity and MathFloor(sanity.current) or 0,
         maxSanity = sanity and MathFloor(sanity.max) or 0,
-        moisture = player:GetMoisture and MathFloor(player:GetMoisture()) or 0,
-        temperature = player:GetTemperature and MathFloor(player:GetTemperature()) or 0,
-        isFreezing = player:IsFreezing and player:IsFreezing() or false,
-        isOverheating = player:IsOverheating and player:IsOverheating() or false,
+        moisture = player.GetMoisture and MathFloor(player:GetMoisture()) or 0,
+        temperature = player.GetTemperature and MathFloor(player:GetTemperature()) or 0,
+        isFreezing = player.IsFreezing and player:IsFreezing() or false,
+        isOverheating = player.IsOverheating and player:IsOverheating() or false,
         pos = { x = px, y = py, z = pz },
         facing = player.Transform:GetRotation() or 0,
         isBusy = player.sg:HasStateTag("busy") or player.sg:HasStateTag("doing") or false,
@@ -232,7 +231,7 @@ end
 
 -- World state
 function Perception.WorldState()
-    local w = _G.TheWorld
+    local w = TheWorld
     local s = w.state
     return {
         cycle = s.cycles + 1,
@@ -272,8 +271,8 @@ function Perception.Inventory(player)
         end
         -- Durability/uses
         if item.components.finiteuses then
-            entry.uses = MathFloor(item.components.finiteuses:GetUses())
-            entry.maxUses = MathFloor(item.components.finiteuses:GetMaxUses())
+            entry.uses = MathFloor(item.components.finiteuses.current or 0)
+            entry.maxUses = MathFloor(item.components.finiteuses.total or 0)
         end
         -- Freshness
         if item.components.perishable then
@@ -314,7 +313,7 @@ function Perception.Recipes(player)
     local result = {}
     if not player.components.builder then return result end
 
-    for _, recipe in pairs(_G.AllRecipes) do
+    for _, recipe in pairs(AllRecipes) do
         -- Skip tech-locked recipes for now (need science machine)
         local canBuild = player.components.builder:CanBuild(recipe.name)
         -- Only include if can build or close to it
