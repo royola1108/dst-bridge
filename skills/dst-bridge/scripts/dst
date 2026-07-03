@@ -117,7 +117,23 @@ const commands = {
 
   // ─── Queue management ───
   async cancel() { console.log(await callApi("cancel")); },
-  async interrupt() { console.log(await callApi("cancel")); },
+  async interrupt() { console.log(await callApi("interrupt")); },
+
+  // ─── High-level commands (Phase 2) ───
+  async situation() { console.log(await callApi("situation")); },
+
+  async goal(args) {
+    const goalText = args.join(" ");
+    if (!goalText) { console.error('Usage: dst goal "gather logs 20"'); process.exit(1); }
+    console.log(await callApi("goal", { goal: goalText }));
+  },
+
+  async goals() { console.log(await callApi("goals")); },
+
+  async wait(args) {
+    const timeout = args[0] ? parseInt(args[0], 10) : 120;
+    console.log(await callApi("wait", { timeout }));
+  },
 
   // ─── Config ───
   async server(args) {
@@ -134,13 +150,24 @@ const commands = {
     console.log(`
 dst — play Don't Starve Together via AI bridge
 
-  dst state                 Current state (HP/hunger/sanity/season/pos/inventory)
+High-level (recommended):
+  dst situation             Full picture: state + goal + alerts + events
+  dst goal "gather logs 20" Give a high-level goal (auto-executes)
+  dst goal "craft axe"      Craft an item
+  dst goal "build campfire" Build something
+  dst goal "survive-night"  Stay alive until dawn
+  dst goal "explore north"  Walk in a direction
+  dst wait [timeout]        Block until goal finishes/gets interrupted
+  dst goals                 View current + past goals
+  dst interrupt             Stop current goal + cancel all actions
+
+Low-level (debugging):
+  dst state                 Current state snapshot
   dst nearby [prefab]       Nearby entities (filter: dst nearby tree)
-    --action ACTION          Filter by action: dst nearby --action chop
+    --action ACTION          Filter: dst nearby --action chop
   dst inv                   Inventory + equipment
-  dst events [--since N]    Recent events
+  dst events [--since N]    Recent events (includes chat messages)
   dst queue                 View command queue
-  dst cancel                Cancel all queued + abort current action
   dst status                Bridge connection status
 
 Actions (target by GUID from 'dst nearby'):

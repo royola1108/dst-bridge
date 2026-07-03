@@ -106,8 +106,12 @@ export function formatEvents(slot, since, limit) {
   const now = Date.now();
   const lines = events.map((e) => {
     const ago = Math.round((now - (e.ts || 0)) / 1000);
+    const critical = e.critical ? " ⚠" : "";
+    if (e.kind === "chat" && e.data?.message) {
+      return `  #${e.seq} [chat] "${e.data.message}"${critical}  ${ago}s ago`;
+    }
     const data = e.data ? " " + JSON.stringify(e.data) : "";
-    return `  #${e.seq} [${e.kind}]${data}  ${ago}s ago`;
+    return `  #${e.seq} [${e.kind}]${data}${critical}  ${ago}s ago`;
   });
   return `Events[${events.length}]:\n` + lines.join("\n");
 }
@@ -168,3 +172,78 @@ function formatEntityState(e) {
   if (s.stackSize != null && s.stackSize > 1) parts.push(`x${s.stackSize}`);
   return parts.join(" ");
 }
+
+// ─── Phase 2 formatters ───
+
+export function formatSituation(slot, goal, events, alerts) {
+  if (!slot || !slot.current) return "DST: NOT CONNECTED";
+  const s = slot.current;
+  const p = s.player;
+  const w = s.world;
+  const lines = [
+    "=== SITUATION ===",
+    `HP:${p.health}/${p.maxHealth} Hgr:${p.hunger}/${p.maxHunger} San:${p.sanity}/${p.maxSanity}`,
+    `Day${w.cycle} ${w.season} ${w.phase}(${w.remainingDaysInSeason}/12) Moon:${w.moonPhase} Rain:${w.isRaining ? "yes" : "no"}`,
+    `Pos:(${Math.round(p.pos.x)},${Math.round(p.pos.z)}) Light:${p.inLight ? "yes" : "no"} Busy:${p.isBusy ? "yes" : "no"} Ghost:${p.isGhost ? "yes" : "no"}`,
+  ];
+
+  if (goal) {
+    lines.push("", `Goal: ${goal.text}`, `  Progress: ${formatProgress(goal)}`, `  Status: ${goal.status}`);
+  }
+
+  if (alerts && alerts.length) {
+    lines.push("", "Alerts:");
+    alerts.forEach((a) => lines.push(`  ${a}`));
+  }
+
+  if (events && events.length) {
+    lines.push("", `Events (last 60s):`);
+    events.forEach((e) => {
+      if (e.kind === "chat") {
+        lines.push(`  [chat] "${e.data?.message || ""}"`);
+      } else {
+        lines.push(`  [${e.kind}] ${e.data ? JSON.stringify(e.data) : ""}`);
+      }
+    });
+  }
+
+  return lines.join("\n");
+}
+
+export function formatWaitResult(result) {
+  if (result.status === "no_goal") return result.message || "no active goal";
+  const lines = [
+    "=== WAIT RESULT ===",
+    `goal: ${result.goal}`,
+    `status: ${result.status}`,
+  ];
+  if (result.reason) lines.push(`reason: ${result.reason}`);
+  if (result.elapsed) lines.push(`elapsed: ${result.elapsed}`);
+  if (result.progress && Object.keys(result.progress).length) {
+    lines.push(`progress: ${JSON.stringify(result.progress)}`);
+  }
+  if (result.situation) lines.push("", `current: ${result.situation}`);
+  if (result.suggested) lines.push("", `suggested next: ${result.suggested}`);
+  return lines.join("\n");
+}
+
+export function formatInterruptResult(cancelled, macro) {
+  const goal = macro.getHistory();
+  const last = goal[goal.length - 1];
+  const goalText = last ? last.text : "(no goal)";
+  const lines = [
+    `✓ interrupted: ${goalText}`,
+    `  ${cancelled.length} queued commands cancelled`,
+    `  current action: aborted`,
+  ];
+  return lines.join("\n");
+}
+
+function formatProgress(goal) {
+  const p = goal.progress || {};
+  if (p.have != null && p.need != null) {
+    return `${p.have}/${p.need}`;
+  }
+  return "";
+}
+

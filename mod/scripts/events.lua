@@ -122,6 +122,13 @@ function Events.Register(player, bridgeUrl, playerUserId)
         postEvent("respawn", {})
     end)
 
+    -- Chat messages — always forwarded to CC (critical event)
+    player:ListenForEvent("ontalk", function(inst, data)
+        postEvent("chat", {
+            message = data.text or "",
+        })
+    end)
+
     print("[dst-bridge] events registered for " .. (player.name or "player"))
 end
 

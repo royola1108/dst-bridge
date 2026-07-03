@@ -1,6 +1,9 @@
 import { config } from "./config.js";
 import { StateCache } from "./state.js";
 import { CommandQueue } from "./queue.js";
+import { MacroExecutor } from "./macro.js";
+import { WaitManager } from "./waitManager.js";
+import { ReflexEngine } from "./reflex.js";
 import {
   formatState,
   formatNearby,
@@ -10,15 +13,28 @@ import {
   formatStatus,
   formatDoResult,
   formatCancelResult,
+  formatSituation,
+  formatWaitResult,
+  formatInterruptResult,
 } from "./format.js";
 
 export function createServer() {
   const stateCache = new StateCache();
   const queue = new CommandQueue();
+  const macro = new MacroExecutor(stateCache, queue);
+  const waiter = new WaitManager(macro, stateCache);
+  const reflex = new ReflexEngine(stateCache, queue, macro);
   let startTime = Date.now();
   let totalProcessed = 0;
 
-  setInterval(() => queue.checkTimeouts(), 2000);
+  // Periodic: check macro executor state + notify waiter
+  setInterval(() => {
+    queue.checkTimeouts();
+    if (macro.getStatus()) {
+      macro.executeNextStep();
+      waiter.notifyGoalChange();
+    }
+  }, 1000);
   setInterval(() => stateCache.cleanup(), 60000);
   setInterval(() => queue.cleanup(), 60000);
 
@@ -100,8 +116,20 @@ export function createServer() {
       if (path === "/event" && method === "POST") {
         const body = await readBody(req);
         const puid = body.playerUserId || "default";
-        stateCache.addEvent(puid, { kind: body.kind, data: body.data, ts: body.ts });
-        // TODO: Phase 3 reflex engine hook
+        const event = stateCache.addEvent(puid, { kind: body.kind, data: body.data, ts: body.ts });
+
+        // Chat events are always critical — surface to CC immediately
+        const CRITICAL_EVENTS = ["chat", "death"];
+        if (CRITICAL_EVENTS.includes(body.kind)) {
+          event.critical = true;
+          console.log(`[bridge] critical event: ${body.kind}`, JSON.stringify(body.data));
+          macro.handleCriticalEvent(event);
+          waiter.notifyCriticalEvent(event);
+        }
+
+        // Phase 3: reflex engine handles urgent events
+        reflex.handleEvent(event, puid);
+
         sendJson(res, 200, { ok: true });
         return;
       }
@@ -174,17 +202,71 @@ export function createServer() {
           case "cancel":
           case "interrupt": {
             const cancelled = queue.cancelAll(puid);
+            macro.interrupt();
             sendText(res, 200, formatCancelResult(cancelled));
             return;
           }
 
-          // Phase 2 stubs — return "not yet implemented"
-          case "situation":
-          case "goal":
-          case "goals":
-          case "wait":
-            sendText(res, 501, `(not yet implemented: ${tool})`);
+          // ─── Phase 2: high-level commands ───
+          case "goal": {
+            const goalText = body.goal || "";
+            if (!goalText) {
+              sendText(res, 400, "Missing goal text. Usage: dst goal \"gather logs 20\"");
+              return;
+            }
+            const result = macro.start(goalText, puid);
+            if (result.accepted) {
+              sendText(res, 200, `✓ ${result.message}`);
+            } else {
+              sendText(res, 400, `✗ ${result.error}`);
+            }
             return;
+          }
+
+          case "goals": {
+            const current = macro.getStatus();
+            const history = macro.getHistory();
+            const lines = [];
+            if (current) {
+              const p = current.progress || {};
+              const progStr = p.have != null && p.need != null ? `${p.have}/${p.need}` : "";
+              lines.push(`  [active] ${current.text} — ${current.status} (${progStr})`);
+            }
+            for (const g of history.slice(-5).reverse()) {
+              lines.push(`  [${g.status}] ${g.text} — ${g.reason || "completed"} (${Math.round((g.completedAt - g.startedAt) / 1000)}s ago)`);
+            }
+            if (lines.length === 0) sendText(res, 200, "Goals: (none yet)");
+            else sendText(res, 200, `Goals:\n${lines.join("\n")}`);
+            return;
+          }
+
+          case "wait": {
+            const timeout = body.timeout || config.waitDefaultTimeout;
+            const result = await waiter.wait(puid, timeout);
+            sendText(res, 200, formatWaitResult(result));
+            return;
+          }
+
+          case "situation": {
+            const slot = stateCache.get(puid);
+            const goal = macro.getStatus();
+            const events = stateCache.getEvents(puid, null, 5);
+            const alerts = [];
+            // Check for alerts
+            if (slot?.current?.player?.isGhost) alerts.push("⚠ YOU ARE DEAD (ghost)");
+            if (slot?.current?.player?.health < 30) alerts.push("⚠ health critical");
+            if (slot?.current?.player?.hunger < 30) alerts.push("⚠ hunger critical");
+            if (slot?.current?.world?.phase === "night" && !slot?.current?.player?.inLight) alerts.push("⚠ in darkness at night");
+            sendText(res, 200, formatSituation(slot, goal, events, alerts));
+            return;
+          }
+
+          case "interrupt": {
+            const cancelled = queue.cancelAll(puid);
+            macro.interrupt();
+            sendText(res, 200, formatInterruptResult(cancelled, macro));
+            return;
+          }
 
           default:
             sendText(res, 404, `Unknown tool: ${tool}`);
