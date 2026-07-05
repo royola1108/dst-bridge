@@ -361,7 +361,8 @@ end
 function Perception.NearbyPlayers(player, radius)
     local px, py, pz = player.Transform:GetWorldPosition()
     local result = {}
-    for _, p in pairs(AllPlayers) do
+    local allPlayers = GLOBAL.AllPlayers or {}
+    for _, p in pairs(allPlayers) do
         if p ~= player and not p:HasTag("dst_bridge_ai") and p.entity:IsValid() then
             local ex, ey, ez = p.Transform:GetWorldPosition()
             local dist = CalcDistance(px, pz, ex, ez)
