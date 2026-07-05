@@ -25,10 +25,11 @@ const NOTIFY_EVENTS = new Set([
 ]);
 
 export class ReflexEngine {
-  constructor(stateCache, cmdQueue, macroExecutor) {
+  constructor(stateCache, cmdQueue, macroExecutor, waiter) {
     this.stateCache = stateCache;
     this.cmdQueue = cmdQueue;
     this.macro = macroExecutor;
+    this.waiter = waiter;
     this.reflexLog = [];
     this.maxLog = 50;
     this.enabled = config.deepseekKey !== "" || true; // always enable, LLM is optional
@@ -78,6 +79,15 @@ export class ReflexEngine {
           // LLM says we can't handle this — escalate to CC
           this.macro.complete("interrupted", `reflex: ${action.reason || kind}`);
           this.log(kind, "escalate", action);
+          // Push as critical event so dst wait resolves immediately
+          const escalateEvent = this.stateCache.addEvent(playerUserId, {
+            kind: "reflex_escalate",
+            data: { reason: action.reason || kind, originalEvent: kind },
+            ts: Date.now(),
+          });
+          escalateEvent.critical = true;
+          console.log(`[bridge] critical event: reflex_escalate (${kind})`);
+          if (this.waiter) this.waiter.notifyCriticalEvent(escalateEvent);
         } else {
           this.log(kind, "llm_no_action", null);
         }

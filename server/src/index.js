@@ -23,7 +23,7 @@ export function createServer() {
   const queue = new CommandQueue();
   const macro = new MacroExecutor(stateCache, queue);
   const waiter = new WaitManager(macro, stateCache);
-  const reflex = new ReflexEngine(stateCache, queue, macro);
+  const reflex = new ReflexEngine(stateCache, queue, macro, waiter);
   let startTime = Date.now();
   let totalProcessed = 0;
 
@@ -118,8 +118,8 @@ export function createServer() {
         const puid = body.playerUserId || "default";
         const event = stateCache.addEvent(puid, { kind: body.kind, data: body.data, ts: body.ts });
 
-        // Chat events with actual text are critical — surface to CC immediately
-        const CRITICAL_EVENTS = ["death"];
+        // Critical events — surface to CC immediately (needs strategic decision)
+        const CRITICAL_EVENTS = ["death", "season_changed", "boss_nearby", "reflex_escalate"];
         if (CRITICAL_EVENTS.includes(body.kind)) {
           event.critical = true;
           console.log(`[bridge] critical event: ${body.kind}`, JSON.stringify(body.data));
@@ -207,6 +207,7 @@ export function createServer() {
                 invObjectGuid: body.invObjectGuid,
                 pos: body.pos,
                 recipe: body.recipe,
+                text: body.text,
                 stateSeq: stateCache.get(puid).seq,
               },
               puid

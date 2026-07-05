@@ -170,6 +170,20 @@ function Actions.Execute(player, cmd)
         return
     end
 
+    -- Say something in game (uses talker component, no BufferedAction needed)
+    if cmd.action == "say" then
+        print("[dst-bridge] say: " .. tostring(cmd.text))
+        if player.components.talker then
+            player.components.talker:Say(cmd.text or "...")
+        end
+        -- Also announce in chat so all players can see it
+        if _G.TheNet then
+            _G.TheNet:Announce((player.name or "Wilson") .. ": " .. (cmd.text or "..."), player.entity)
+        end
+        ReportResult(cmd, "completed", nil, { action = "say", text = cmd.text })
+        return
+    end
+
     -- Generic action via ACTION_MAP
     local action = ACTION_MAP[cmd.action]
     if not action then

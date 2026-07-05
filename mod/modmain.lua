@@ -134,6 +134,22 @@ local function Tick()
     -- 1. Gather state
     local state = Perception.Snapshot(agentPlayer, PERCEPTION_RADIUS)
 
+    -- 1b. Check for boss nearby (push as event if found)
+    if state.nearby then
+        for _, ent in ipairs(state.nearby) do
+            if ent.isBoss then
+                local bossData = _G.json.encode({
+                    ts = _G.GetTime(),
+                    playerUserId = agentUserId,
+                    kind = "boss_nearby",
+                    data = { prefab = ent.prefab, guid = ent.guid, distance = ent.distance },
+                })
+                TheSim:QueryServer(BRIDGE_URL .. "/event", function() end, "POST", bossData)
+                break
+            end
+        end
+    end
+
     -- 2. Collect pending action results
     local executingResults = Actions.GetPendingResults()
 
@@ -166,3 +182,30 @@ AddPrefabPostInit("world", function(inst)
     inst:DoPeriodicTask(POLL_INTERVAL, Tick)
     print("[dst-bridge] started, polling " .. BRIDGE_URL .. " every " .. POLL_INTERVAL .. "s")
 end)
+
+-- Hook ALL players' talker to capture human player chat (not just AI Wilson)
+-- Player-typed chat goes through Networking_Say (not talker:Say which is character voice lines)
+local _Networking_Say = _G.Networking_Say
+_G.Networking_Say = function(...)
+    local args = { ... }
+    -- Networking_Say(clientid, userid, playername, prefab, message, colour, isemoji, isnn, ...)
+    local userid = args[2]
+    local playerName = args[3] or userid
+    local message = args[5]
+    if message and message ~= "" then
+        local eventData = _G.json.encode({
+            ts = _G.GetTime(),
+            playerUserId = "AI_AGENT",
+            kind = "chat",
+            data = { message = message, from = playerName },
+        })
+        TheSim:QueryServer(
+            BRIDGE_URL .. "/event",
+            function() end,
+            "POST",
+            eventData
+        )
+    end
+    return _Networking_Say(userid, message, ...)
+end
+print("[dst-bridge] chat capture via Networking_Say hook installed")

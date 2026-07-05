@@ -1,12 +1,10 @@
 ---
 name: dst-bridge
-metadata:
-  version: 0.1.0
-  description: >-
-    Play Don't Starve Together as an AI survivor. Gather resources, craft tools,
-    build a base, survive the night, and don't starve. Use this skill whenever
-    the user mentions Don't Starve Together, DST, 饥荒, or wants an AI to play
-    a survival game.
+description: >-
+  Play Don't Starve Together as an AI survivor. Gather resources, craft tools,
+  build a base, survive the night, and don't starve. Use this skill whenever
+  the user mentions Don't Starve Together, DST, 饥荒, or wants an AI to play
+  a survival game.
 ---
 
 # Don't Starve Together · 饥荒联机版

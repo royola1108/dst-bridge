@@ -4,11 +4,12 @@ export class CommandQueue {
   constructor() {
     this.commands = new Map();
     this.order = [];
+    this.priorityOrder = []; // say + interrupt go first
     this.leases = new Map();
   }
 
   enqueue(command, playerUserId) {
-    if (this.order.length >= config.maxQueueSize) {
+    if (this.order.length + this.priorityOrder.length >= config.maxQueueSize) {
       throw new Error("Command queue full");
     }
     const id = command.id || "cmd-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -21,13 +22,41 @@ export class CommandQueue {
       onComplete: null,
     };
     this.commands.set(id, cmd);
-    this.order.push(id);
+    // say is instant and non-blocking — always go first
+    const INSTANT_ACTIONS = new Set(["say"]);
+    if (INSTANT_ACTIONS.has(cmd.action)) {
+      this.priorityOrder.push(id);
+    } else {
+      this.order.push(id);
+    }
     return cmd;
   }
 
   leaseBatch(playerUserId, maxCount = 8) {
     const leased = [];
     const remaining = [];
+    const remainingPriority = [];
+
+    // Priority commands first (say, etc.)
+    for (const id of this.priorityOrder) {
+      const cmd = this.commands.get(id);
+      if (!cmd || cmd.playerUserId !== playerUserId) {
+        if (cmd) remainingPriority.push(id);
+        continue;
+      }
+      if (leased.length >= maxCount) {
+        remainingPriority.push(id);
+        continue;
+      }
+      cmd.status = "leased";
+      cmd.leaseId = "lease-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+      cmd.leasedAt = Date.now();
+      cmd.leaseTimeoutMs = config.leaseTimeoutMs;
+      this.leases.set(cmd.leaseId, id);
+      leased.push(this._publicCmd(cmd));
+    }
+
+    // Normal commands
     for (const id of this.order) {
       const cmd = this.commands.get(id);
       if (!cmd || cmd.playerUserId !== playerUserId) {
@@ -46,6 +75,7 @@ export class CommandQueue {
       leased.push(this._publicCmd(cmd));
     }
     this.order = remaining;
+    this.priorityOrder = remainingPriority;
     return leased;
   }
 
@@ -84,19 +114,22 @@ export class CommandQueue {
   cancelAll(playerUserId) {
     const cancelled = [];
     const remaining = [];
-    for (const id of this.order) {
-      const cmd = this.commands.get(id);
-      if (!cmd) continue;
-      if (cmd.playerUserId === playerUserId) {
-        cmd.status = "cancelled";
-        cmd.completedAt = Date.now();
-        cancelled.push(id);
-        if (cmd.onComplete) cmd.onComplete(cmd);
-      } else {
-        remaining.push(id);
+    for (const queue of [this.priorityOrder, this.order]) {
+      for (const id of queue) {
+        const cmd = this.commands.get(id);
+        if (!cmd) continue;
+        if (cmd.playerUserId === playerUserId) {
+          cmd.status = "cancelled";
+          cmd.completedAt = Date.now();
+          cancelled.push(id);
+          if (cmd.onComplete) cmd.onComplete(cmd);
+        } else {
+          remaining.push(id);
+        }
       }
     }
     this.order = remaining;
+    this.priorityOrder = [];
     return cancelled;
   }
 
@@ -118,6 +151,7 @@ export class CommandQueue {
       invObjectGuid: cmd.invObjectGuid ?? null,
       pos: cmd.pos ?? null,
       recipe: cmd.recipe ?? null,
+      text: cmd.text ?? null,
       leaseId: cmd.leaseId,
       leaseTimeoutMs: cmd.leaseTimeoutMs,
       stateSeq: cmd.stateSeq ?? null,

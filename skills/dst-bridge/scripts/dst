@@ -125,6 +125,12 @@ const commands = {
     console.log(await callApi("do", { action: "store", invObjectGuid: parseGuid(args[0]), targetGuid: parseGuid(args[1]) }));
   },
 
+  async say(args) {
+    const text = args.join(" ");
+    if (!text) { console.error("Usage: dst say <message>"); process.exit(1); }
+    console.log(await callApi("do", { action: "say", text }));
+  },
+
   // ─── Queue management ───
   async cancel() { console.log(await callApi("cancel")); },
   async interrupt() { console.log(await callApi("interrupt")); },
@@ -204,6 +210,7 @@ Actions (target by GUID from 'dst nearby'):
   dst light GUID            dst activate GUID    dst extinguish GUID
   dst fish GUID             dst net GUID         dst mount GUID
   dst jumpin GUID           dst rummage GUID
+  dst say "message"         Wilson says something in game
 
 Setup:
   dst server [URL]          Set/get bridge server URL

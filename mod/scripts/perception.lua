@@ -172,7 +172,7 @@ function Perception.NearbyEntities(player, radius)
             local dist = CalcDistance(px, pz, ex, ez)
             local actions = AvailableActions(ent, player)
             -- Include entities with actions OR visible items
-            if actions or ent.components.inventoryitem then
+            if actions or ent.components.inventoryitem or ent:HasTag("epic") then
                 table.insert(result, {
                     guid = ent.GUID,
                     prefab = ent.prefab,
@@ -181,6 +181,7 @@ function Perception.NearbyEntities(player, radius)
                     distance = MathFloor(dist * 10) / 10,
                     bearing = CalcBearing(player, { x = ex, y = ey, z = ez }),
                     actions = actions,
+                    isBoss = ent:HasTag("epic"),
                     state = EntityState(ent, player),
                 })
             end

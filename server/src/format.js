@@ -212,6 +212,23 @@ export function formatSituation(slot, goal, events, alerts) {
 
 export function formatWaitResult(result) {
   if (result.status === "no_goal") return result.message || "no active goal";
+  if (result.status === "timeout") return result.message || "timeout — no events";
+  if (result.status === "event" && result.event) {
+    const ev = result.event;
+    const lines = [
+      "=== WAIT RESULT ===",
+      `status: event (${ev.kind})`,
+    ];
+    if (ev.data) {
+      if (ev.kind === "chat") {
+        const from = ev.data.from || "player";
+        lines.push(`chat: <${from}> ${ev.data.message || ""}`);
+      } else {
+        lines.push(`data: ${JSON.stringify(ev.data)}`);
+      }
+    }
+    return lines.join("\n");
+  }
   const lines = [
     "=== WAIT RESULT ===",
     `goal: ${result.goal}`,
@@ -221,6 +238,14 @@ export function formatWaitResult(result) {
   if (result.elapsed) lines.push(`elapsed: ${result.elapsed}`);
   if (result.progress && Object.keys(result.progress).length) {
     lines.push(`progress: ${JSON.stringify(result.progress)}`);
+  }
+  if (result.event) {
+    const ev = result.event;
+    if (ev.kind === "chat") {
+      lines.push("", `chat: <${ev.data?.from || "player"}> ${ev.data?.message || ""}`);
+    } else {
+      lines.push("", `event: ${ev.kind} ${JSON.stringify(ev.data || {})}`);
+    }
   }
   if (result.situation) lines.push("", `current: ${result.situation}`);
   if (result.suggested) lines.push("", `suggested next: ${result.suggested}`);

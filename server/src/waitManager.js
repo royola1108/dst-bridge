@@ -10,7 +10,7 @@ export class WaitManager {
     this.pendingWaits = []; // active wait requests
   }
 
-  // Start a wait — returns a promise that resolves when goal ends or timeout
+  // Start a wait — returns a promise that resolves when goal ends, critical event, or timeout
   async wait(playerUserId, timeout = config.waitDefaultTimeout) {
     return new Promise((resolve) => {
       const waitEntry = {
@@ -26,15 +26,7 @@ export class WaitManager {
         resolve(this.buildTimeoutResult());
       }, timeout * 1000);
 
-      // Check immediately if goal already ended
-      const goal = this.macro.getStatus();
-      if (!goal) {
-        // No active goal
-        clearTimeout(waitEntry.timeoutId);
-        resolve({ status: "no_goal", message: "no active goal — use 'dst goal' to start one" });
-        return;
-      }
-
+      // Always wait — even without an active goal, critical events (chat) can arrive
       this.pendingWaits.push(waitEntry);
     });
   }
@@ -60,22 +52,30 @@ export class WaitManager {
   notifyCriticalEvent(event) {
     if (this.pendingWaits.length === 0) return;
 
-    // Check if macro executor handled it (interrupted goal)
     const goal = this.macro.getStatus();
-    if (!goal) {
-      // Goal was interrupted by the event
-      const history = this.macro.getHistory();
-      const last = history[history.length - 1];
-      if (last) {
-        const result = this.buildGoalResult(last);
-        result.event = event;
-        for (const wait of this.pendingWaits) {
-          clearTimeout(wait.timeoutId);
-          wait.resolve(result);
-        }
-        this.pendingWaits = [];
+    if (goal) {
+      // Goal is still active — don't resolve, let macro handle interruption
+      return;
+    }
+
+    // No active goal — resolve waits with the event
+    const history = this.macro.getHistory();
+    const last = history[history.length - 1];
+    if (last) {
+      const result = this.buildGoalResult(last);
+      result.event = event;
+      for (const wait of this.pendingWaits) {
+        clearTimeout(wait.timeoutId);
+        wait.resolve(result);
+      }
+    } else {
+      // No goal history either — just return the event
+      for (const wait of this.pendingWaits) {
+        clearTimeout(wait.timeoutId);
+        wait.resolve({ status: "event", event });
       }
     }
+    this.pendingWaits = [];
   }
 
   removeWait(waitEntry) {
@@ -107,7 +107,7 @@ export class WaitManager {
 
   buildTimeoutResult() {
     const goal = this.macro.getStatus();
-    if (!goal) return { status: "no_goal" };
+    if (!goal) return { status: "timeout", message: "no events or goal changes — try again" };
 
     const elapsed = Math.round((Date.now() - goal.startedAt) / 1000);
     return {
