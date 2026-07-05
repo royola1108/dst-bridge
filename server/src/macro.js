@@ -88,8 +88,12 @@ export class MacroExecutor {
   executeNextStep() {
     if (!this.current || this.current.status !== "running") return;
 
+    // Don't execute if we're waiting for a command to complete
+    if (this.current.currentCmdId) return;
+
     const step = this.current.steps[this.current.stepIndex];
     if (!step) {
+      console.log(`[macro] goal "${this.current.text}" — no more steps, done`);
       this.complete("done");
       return;
     }
@@ -102,11 +106,33 @@ export class MacroExecutor {
 
     // Dynamic step: generate command based on current state
     if (step.dynamic) {
-      const cmd = step.dynamic(this.getState(), this.current);
+      const state = this.getState();
+      if (!state) {
+        return; // no state yet, wait
+      }
+      const cmd = step.dynamic(state, this.current);
       if (!cmd) {
-        // Can't execute this step right now, try again next tick
+        // null = can't execute now, retry next tick (NOT skip)
         return;
       }
+      // Skip noop/wait commands — don't send to DST, advance to next step
+      if (cmd.action === "__noop__") {
+        console.log(`[macro] step ${this.current.stepIndex} — noop, advancing`);
+        this.current.stepIndex++;
+        this.executeNextStep();
+        return;
+      }
+      // __done__ means the goal is complete
+      if (cmd.action === "__done__") {
+        console.log(`[macro] step ${this.current.stepIndex} — done signal, goal complete`);
+        this.complete("done");
+        return;
+      }
+      // __wait__ means stay on this step, retry next tick
+      if (cmd.action === "__wait__") {
+        return;
+      }
+      console.log(`[macro] step ${this.current.stepIndex} — enqueueing: ${cmd.action} ${cmd.targetGuid || cmd.recipe || JSON.stringify(cmd.pos || "")}`);
       this.enqueueCommand(cmd, step);
       return;
     }
@@ -133,14 +159,17 @@ export class MacroExecutor {
   // Called when a command completes
   onStepComplete(step, result) {
     if (!this.current) return;
+    this.current.currentCmdId = null;
 
     if (result.status === "completed") {
       // Update progress
       if (step.updateProgress) {
         step.updateProgress(this.current.progress, result, this.getState());
       }
-      this.current.stepIndex++;
-      this.current.currentCmdId = null;
+      // For loop steps (with isLoop=true), don't advance stepIndex — repeat
+      if (!step.isLoop) {
+        this.current.stepIndex++;
+      }
       this.executeNextStep();
     } else if (result.status === "failed" || result.status === "timeout") {
       // Check if step has a retry/fallback
@@ -310,14 +339,15 @@ function planGather(params) {
         }
         goal.progress.have = have;
         goal.progress.need = count;
-        if (have >= count) return { action: "__noop__" }; // done
-        return null; // proceed to next step
+        if (have >= count) return { action: "__done__" }; // already have enough
+        return { action: "__noop__" }; // proceed to next step
       },
-      command: null, // no command, just check
+      command: null,
     },
     {
       id: "gather-loop",
       description: `Find and gather ${prefab} until ${count}`,
+      isLoop: true,
       dynamic: (state, goal) => {
         if (!state) return null;
         let have = 0;
@@ -325,7 +355,8 @@ function planGather(params) {
           if (aliases.includes(item.prefab)) have += item.stackSize || 1;
         }
         goal.progress.have = have;
-        if (have >= count) return null; // done, move to next step (there is none)
+        goal.progress.need = count;
+        if (have >= count) return { action: "__done__" }; // goal complete
 
         // Find nearest target based on prefab
         const target = findGatherTarget(state, prefab, aliases);

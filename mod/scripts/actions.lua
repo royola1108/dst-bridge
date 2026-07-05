@@ -81,8 +81,7 @@ function Actions.WalkTo(player, pos, cmd)
         ReportResult(cmd, "failed", "no_position")
         return
     end
-    local target = Vector3(pos.x, 0, pos.z)
-    player.components.locomotor:GoToPoint(target, true)
+    player.components.locomotor:GoToPoint(Vector3(pos.x, 0, pos.z), nil, true)
     ReportResult(cmd, "accepted")
     -- Track completion via distance check
     player:DoTaskInTime(0.5, function()

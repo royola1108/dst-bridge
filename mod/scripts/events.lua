@@ -123,11 +123,22 @@ function Events.Register(player, bridgeUrl, playerUserId)
     end)
 
     -- Chat messages — always forwarded to CC (critical event)
-    player:ListenForEvent("ontalk", function(inst, data)
-        postEvent("chat", {
-            message = data.text or "",
-        })
-    end)
+    -- DST's ontalk event doesn't carry the message text
+    -- Player chat goes through TheNet system; use talker.ontalk callback instead
+    if player.components.talker then
+        local originalOntalk = player.components.talker.ontalk
+        player.components.talker.ontalk = function(inst, script)
+            -- script is the message text (string) on server side
+            local message = type(script) == "string" and script or ""
+            if message and message ~= "" then
+                postEvent("chat", { message = message })
+            end
+            -- Call original if exists
+            if originalOntalk then
+                originalOntalk(inst, script)
+            end
+        end
+    end
 
     print("[dst-bridge] events registered for " .. (player.name or "player"))
 end

@@ -7,22 +7,32 @@ const path = require("path");
 const os = require("os");
 
 const CONFIG_FILE = path.join(os.homedir(), ".dst-bridge.json");
-const DEFAULT_SERVER = "http://127.0.0.1:3002";
+const DEFAULT_SERVER = "https://dst.royola.dev";
+
+function getConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
 
 function getServer() {
-  try {
-    const c = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
-    return c.server || DEFAULT_SERVER;
-  } catch {
-    return DEFAULT_SERVER;
-  }
+  return getConfig().server || DEFAULT_SERVER;
+}
+
+function getApiKey() {
+  return getConfig().apiKey || "";
 }
 
 async function callApi(tool, args = {}) {
   const server = getServer();
+  const headers = { "content-type": "application/json" };
+  const key = getApiKey();
+  if (key) headers["authorization"] = `Bearer ${key}`;
   const res = await fetch(`${server}/api/${tool}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(args),
   });
   const text = await res.text();
@@ -138,10 +148,23 @@ const commands = {
   // ─── Config ───
   async server(args) {
     if (args[0]) {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify({ server: args[0] }));
+      const cfg = getConfig();
+      cfg.server = args[0];
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
       console.log(`Server set to ${args[0]}`);
     } else {
       console.log(`Server: ${getServer()}`);
+      console.log(`API key: ${getApiKey() ? "set" : "none"}`);
+    }
+  },
+  async key(args) {
+    if (args[0]) {
+      const cfg = getConfig();
+      cfg.apiKey = args[0];
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg));
+      console.log(`API key set`);
+    } else {
+      console.log(`API key: ${getApiKey() ? "set" : "none"}`);
     }
   },
 
@@ -183,7 +206,8 @@ Actions (target by GUID from 'dst nearby'):
   dst jumpin GUID           dst rummage GUID
 
 Setup:
-  dst server [URL]          Set/get bridge server URL (default: localhost:3002)
+  dst server [URL]          Set/get bridge server URL
+  dst key [KEY]             Set/get API key
   dst help                  This message
 
 Server: ${getServer()}

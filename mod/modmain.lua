@@ -14,32 +14,104 @@ local Events = require("bridge_events")
 
 local seq = 0
 local agentPlayer = nil
-local agentUserId = nil
+local agentUserId = "AI_AGENT"
 local eventsRegistered = false
+local aiSpawned = false
 
--- Find the player to control
-local function FindAgentPlayer()
-    if AGENT_USERID ~= "" then
-        -- Look for specific userid
-        for _, v in ipairs(_G.TheNet:GetClientTable()) do
-            if v.userid == AGENT_USERID then
-                -- Find the actual player entity
-                for _, ent in pairs(_G.Ents) do
-                    if ent.userid == v.userid and ent:HasTag("player") then
-                        return ent, v.userid
+-- Spawn an AI companion NPC near the portal
+local function SpawnAICompanion()
+    if aiSpawned then return end
+
+    -- Find the multiplayer portal
+    local portal = nil
+    local px, py, pz = 0, 0, 0
+    for _, ent in pairs(_G.Ents) do
+        if ent.prefab == "multiplayer_portal" and ent.entity:IsVisible() then
+            portal = ent
+            break
+        end
+    end
+
+    if portal then
+        px, py, pz = portal.Transform:GetWorldPosition()
+    else
+        -- Fallback: world origin
+        px, py, pz = 0, 0, 0
+    end
+
+    -- Spawn a Wilson near the portal
+    local aiChar = _G.SpawnPrefab("wilson")
+    if aiChar then
+        -- Place near portal (offset a bit so they don't overlap)
+        aiChar.Transform:SetPosition(px + 3, py, pz + 3)
+
+        -- Mark as AI agent
+        aiChar:AddTag("dst_bridge_ai")
+        aiChar.userid = agentUserId
+
+        -- Auto-respawn on death (AI companion can't die permanently)
+        aiChar:ListenForEvent("death", function(inst)
+            inst:DoTaskInTime(3, function()
+                if inst.components.health then
+                    inst.components.health:SetInvincible(true)
+                end
+                if inst:HasTag("playerghost") then
+                    -- Resurrect
+                    local respawn = _G.SpawnPrefab("resurrectionstone")
+                    if respawn then
+                        respawn.Transform:SetPosition(inst.Transform:GetWorldPosition())
+                        respawn.AnimState:PlayAnimation("idle")
+                        inst:PushEvent("respawnfromghost")
                     end
                 end
-            end
+                -- Remove invincible after respawn
+                inst:DoTaskInTime(5, function()
+                    if inst.components.health then
+                        inst.components.health:SetInvincible(false)
+                    end
+                end)
+            end)
+            print("[dst-bridge] AI companion died, auto-respawning...")
+        end)
+
+        -- Give it god mode initially so it doesn't die before AI starts playing
+        if aiChar.components.health then
+            aiChar.components.health:SetInvincible(true)
+            -- Remove god mode after 30 seconds
+            aiChar:DoTaskInTime(30, function()
+                if aiChar.components.health then
+                    aiChar.components.health:SetInvincible(false)
+                end
+                print("[dst-bridge] AI companion god mode expired")
+            end)
+        end
+
+        print("[dst-bridge] AI companion spawned (Wilson) near portal at (" .. px .. "," .. pz .. ")")
+        aiSpawned = true
+        return aiChar
+    end
+
+    print("[dst-bridge] Failed to spawn AI companion")
+    return nil
+end
+
+-- Find the AI player to control
+local function FindAgentPlayer()
+    -- Look for our AI companion
+    for _, ent in pairs(_G.Ents) do
+        if ent:HasTag("dst_bridge_ai") and ent.entity:IsValid() then
+            return ent, agentUserId
         end
     end
-    -- Default: first connected player
-    for _, v in ipairs(_G.TheNet:GetClientTable()) do
-        for _, ent in pairs(_G.Ents) do
-            if ent.userid == v.userid and ent:HasTag("player") then
-                return ent, v.userid
-            end
+
+    -- If not spawned yet, try to spawn
+    if not aiSpawned then
+        local ai = SpawnAICompanion()
+        if ai then
+            return ai, agentUserId
         end
     end
+
     return nil, nil
 end
 

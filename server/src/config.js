@@ -10,4 +10,5 @@ export const config = {
   staleStateThreshold: parseInt(process.env.DST_STALE_THRESHOLD || "10000", 10),
   deepseekUrl: process.env.DEEPSEEK_URL || "https://api.deepseek.com/v1/chat/completions",
   deepseekKey: process.env.DEEPSEEK_API_KEY || "",
+  apiKey: process.env.DST_API_KEY || "",
 };

@@ -118,11 +118,18 @@ export function createServer() {
         const puid = body.playerUserId || "default";
         const event = stateCache.addEvent(puid, { kind: body.kind, data: body.data, ts: body.ts });
 
-        // Chat events are always critical — surface to CC immediately
-        const CRITICAL_EVENTS = ["chat", "death"];
+        // Chat events with actual text are critical — surface to CC immediately
+        const CRITICAL_EVENTS = ["death"];
         if (CRITICAL_EVENTS.includes(body.kind)) {
           event.critical = true;
           console.log(`[bridge] critical event: ${body.kind}`, JSON.stringify(body.data));
+          macro.handleCriticalEvent(event);
+          waiter.notifyCriticalEvent(event);
+        }
+        // Chat with non-empty message — also critical
+        if (body.kind === "chat" && body.data?.message && body.data.message.trim()) {
+          event.critical = true;
+          console.log(`[bridge] critical event: chat "${body.data.message}"`);
           macro.handleCriticalEvent(event);
           waiter.notifyCriticalEvent(event);
         }
@@ -147,6 +154,15 @@ export function createServer() {
 
       // ─── CLI endpoints (/api/*) ───
       if (path.startsWith("/api/") && method === "POST") {
+        // API key check
+        if (config.apiKey) {
+          const auth = req.headers["authorization"] || "";
+          const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+          if (token !== config.apiKey) {
+            sendJson(res, 401, { error: "unauthorized" });
+            return;
+          }
+        }
         const tool = path.slice(5).split("?")[0];
         const body = await readBody(req);
         const puid = resolvePlayer(body, Object.fromEntries(url.searchParams));

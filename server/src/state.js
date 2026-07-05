@@ -52,10 +52,15 @@ export class StateCache {
   }
 
   getDefaultPlayer() {
+    let best = null;
+    let bestTime = 0;
     for (const [userid, slot] of this.slots) {
-      if (slot.current) return userid;
+      if (slot.current && slot.lastUpdate > bestTime) {
+        best = userid;
+        bestTime = slot.lastUpdate;
+      }
     }
-    return null;
+    return best;
   }
 
   cleanup() {
