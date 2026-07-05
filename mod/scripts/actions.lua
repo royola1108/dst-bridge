@@ -81,9 +81,22 @@ function Actions.WalkTo(player, pos, cmd)
         ReportResult(cmd, "failed", "no_position")
         return
     end
+    if not player.components.locomotor then
+        print("[dst-bridge] ERROR: no locomotor component!")
+        ReportResult(cmd, "failed", "no_locomotor")
+        return
+    end
+    -- Make sure player is awake and can move
+    if player.sg and player.sg:HasStateTag("sleeping") then
+        player.sg:GoToState("wakeup")
+    end
+    -- Clear any existing buffer action
+    player.components.locomotor:Stop()
     player.components.locomotor:GoToPoint(Vector3(pos.x, 0, pos.z), nil, true)
-    ReportResult(cmd, "accepted")
-    -- Track completion via distance check
+    print("[dst-bridge] GoToPoint to (" .. pos.x .. "," .. pos.z .. ") from (" ..
+        math.floor(select(1, player.Transform:GetWorldPosition()) or 0) .. "," ..
+        math.floor(select(3, player.Transform:GetWorldPosition()) or 0) .. ")")
+    -- Track completion via distance check, only report when done
     player:DoTaskInTime(0.5, function()
         local px, _, pz = player.Transform:GetWorldPosition()
         local dx = px - pos.x
@@ -95,13 +108,7 @@ function Actions.WalkTo(player, pos, cmd)
             -- Still walking, check again
             player:DoTaskInTime(1, function()
                 local px2, _, pz2 = player.Transform:GetWorldPosition()
-                local dx2 = px2 - pos.x
-                local dz2 = pz2 - pos.z
-                if math.sqrt(dx2 * dx2 + dz2 * dz2) < 3 then
-                    ReportResult(cmd, "completed", nil, { finalPos = { x = px2, z = pz2 } })
-                else
-                    ReportResult(cmd, "completed", nil, { finalPos = { x = px2, z = pz2 } })
-                end
+                ReportResult(cmd, "completed", nil, { finalPos = { x = px2, z = pz2 } })
             end)
         end
     end)
@@ -143,7 +150,6 @@ function Actions.Build(player, recipeName, pos, cmd)
     end)
 
     player.components.locomotor:PushAction(ba, true)
-    ReportResult(cmd, "accepted")
 end
 
 -- Main execute function
@@ -233,7 +239,6 @@ function Actions.Execute(player, cmd)
 
     -- Execute
     player.components.locomotor:PushAction(ba, true)
-    ReportResult(cmd, "accepted")
 end
 
 -- Get and clear pending results (called by tick)

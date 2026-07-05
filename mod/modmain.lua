@@ -49,6 +49,14 @@ local function SpawnAICompanion()
         aiChar:AddTag("dst_bridge_ai")
         aiChar.userid = agentUserId
 
+        -- Disable built-in AI brain — we control movement via locomotor directly
+        if aiChar.brain then
+            aiChar.brain:Stop()
+        end
+        if aiChar.SetBrain then
+            aiChar:SetBrain(nil)
+        end
+
         -- Auto-respawn on death (AI companion can't die permanently)
         aiChar:ListenForEvent("death", function(inst)
             inst:DoTaskInTime(3, function()
@@ -115,8 +123,21 @@ local function FindAgentPlayer()
     return nil, nil
 end
 
+-- Check if any real (human) player is connected
+local function HasRealPlayer()
+    for _, p in pairs(_G.AllPlayers) do
+        if not p:HasTag("dst_bridge_ai") then
+            return true
+        end
+    end
+    return false
+end
+
 -- Main tick: upload state + get commands
 local function Tick()
+    -- No real player connected — pause everything (no tick, no commands)
+    if not HasRealPlayer() then return end
+
     if not agentPlayer or not agentPlayer.entity:IsValid() then
         agentPlayer, agentUserId = FindAgentPlayer()
         if not agentPlayer then return end
@@ -172,7 +193,12 @@ local function Tick()
 
         -- 4. Execute each command
         for _, cmd in ipairs(resp.commands) do
-            Actions.Execute(agentPlayer, cmd)
+            print("[dst-bridge] executing command: " .. tostring(cmd.action) .. " id=" .. tostring(cmd.id))
+            if not agentPlayer or not agentPlayer.entity:IsValid() then
+                print("[dst-bridge] ERROR: agentPlayer is nil or invalid!")
+            else
+                Actions.Execute(agentPlayer, cmd)
+            end
         end
     end)
 end
@@ -183,15 +209,19 @@ AddPrefabPostInit("world", function(inst)
     print("[dst-bridge] started, polling " .. BRIDGE_URL .. " every " .. POLL_INTERVAL .. "s")
 end)
 
--- Hook ALL players' talker to capture human player chat (not just AI Wilson)
--- Player-typed chat goes through Networking_Say (not talker:Say which is character voice lines)
+-- Hook Networking_Say to capture human player chat
+-- Networking_Say(clientid, userid, playername, prefab, message, colour, isemoji, isnn, ...)
 local _Networking_Say = _G.Networking_Say
 _G.Networking_Say = function(...)
     local args = { ... }
-    -- Networking_Say(clientid, userid, playername, prefab, message, colour, isemoji, isnn, ...)
     local userid = args[2]
     local playerName = args[3] or userid
+    local prefab = args[4]
     local message = args[5]
+    -- Skip AI Wilson's speech — its prefab is "wilson" and userid is "AI_AGENT"
+    if prefab == "wilson" or userid == "AI_AGENT" then
+        return _Networking_Say(...)
+    end
     if message and message ~= "" then
         local eventData = _G.json.encode({
             ts = _G.GetTime(),

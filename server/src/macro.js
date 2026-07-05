@@ -11,6 +11,7 @@ const MACRO_PLANS = {
   "survive-night": planSurviveNight,
   explore: planExplore,
   "return-to-base": planReturnToBase,
+  follow: planFollow,
 };
 
 // Goal registry — maps goal text to a plan
@@ -23,6 +24,8 @@ const GOAL_PATTERNS = [
   { re: /^survive.?night$/, fn: () => ({ type: "survive-night" }) },
   { re: /^explore\s+(\w+)$/, fn: (m) => ({ type: "explore", direction: m[1] }) },
   { re: /^return.?to.?base$/, fn: () => ({ type: "return-to-base" }) },
+  { re: /^follow$/, fn: () => ({ type: "follow" }) },
+  { re: /^follow\s+(.+)$/, fn: (m) => ({ type: "follow", target: m[1] }) },
 ];
 
 export class MacroExecutor {
@@ -286,6 +289,8 @@ export class MacroExecutor {
         return `goal accepted: ${p.type} ${p.recipe}\n  plan: check materials → gather if needed → ${p.type}`;
       case "survive-night":
         return `goal accepted: survive-night\n  plan: build campfire → stay near fire → wait for dawn`;
+      case "follow":
+        return `goal accepted: follow ${p.target || "nearest player"}\n  plan: walk to player → keep following`;
       default:
         return `goal accepted: ${goal.text}`;
     }
@@ -593,4 +598,38 @@ function exploreDir(state, direction) {
   };
   const d = dirs[direction] || dirs.north;
   return { x: Math.round(px + d.x), z: Math.round(pz + d.z) };
+}
+
+function planFollow(params) {
+  const targetName = params.target;
+  return [{
+    id: "follow-loop",
+    description: `Follow ${targetName || "nearest player"}`,
+    isLoop: true,
+    dynamic: (state, goal) => {
+      if (!state?.players || state.players.length === 0) return null;
+
+      // Find target player
+      let target;
+      if (targetName) {
+        target = state.players.find((p) =>
+          p.name?.toLowerCase().includes(targetName.toLowerCase())
+        );
+      }
+      if (!target) target = state.players[0]; // nearest player
+
+      const dist = target.distance;
+      if (dist < 4) return { action: "__noop__" }; // close enough, stand still
+
+      // Walk toward player
+      return {
+        action: "walk_to",
+        pos: { x: Math.round(target.pos.x), z: Math.round(target.pos.z) },
+      };
+    },
+    onFail: () => null,
+    updateProgress: (progress, result) => {
+      progress.target = targetName || "nearest";
+    },
+  }];
 }

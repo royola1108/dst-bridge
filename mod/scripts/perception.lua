@@ -171,8 +171,11 @@ function Perception.NearbyEntities(player, radius)
             local ex, ey, ez = ent.Transform:GetWorldPosition()
             local dist = CalcDistance(px, pz, ex, ez)
             local actions = AvailableActions(ent, player)
-            -- Include entities with actions OR visible items
-            if actions or ent.components.inventoryitem or ent:HasTag("epic") then
+            -- Include entities with actions, items, light sources, or structures
+            local hasLight = ent:HasTag("campfire") or ent:HasTag("fire") or
+                             ent.prefab == "campfire" or ent.prefab == "firepit" or
+                             ent.prefab == "torchfire" or ent.prefab == "coldfire"
+            if actions or ent.components.inventoryitem or ent:HasTag("epic") or hasLight then
                 table.insert(result, {
                     guid = ent.GUID,
                     prefab = ent.prefab,
@@ -354,11 +357,34 @@ function Perception.Recipes(player)
 end
 
 -- Full snapshot
+-- Find nearby human players (for follow/awareness)
+function Perception.NearbyPlayers(player, radius)
+    local px, py, pz = player.Transform:GetWorldPosition()
+    local result = {}
+    for _, p in pairs(AllPlayers) do
+        if p ~= player and not p:HasTag("dst_bridge_ai") and p.entity:IsValid() then
+            local ex, ey, ez = p.Transform:GetWorldPosition()
+            local dist = CalcDistance(px, pz, ex, ez)
+            if dist <= radius then
+                table.insert(result, {
+                    name = p.name or "player",
+                    prefab = p.prefab or "",
+                    guid = p.GUID,
+                    pos = { x = ex, y = ey, z = ez },
+                    distance = MathFloor(dist * 10) / 10,
+                })
+            end
+        end
+    end
+    return result
+end
+
 function Perception.Snapshot(player, radius)
     return {
         player = Perception.PlayerState(player),
         world = Perception.WorldState(),
         nearby = Perception.NearbyEntities(player, radius),
+        players = Perception.NearbyPlayers(player, radius * 3),
         inventory = Perception.Inventory(player),
         equipped = Perception.Equipped(player),
         recipes = Perception.Recipes(player),

@@ -122,23 +122,8 @@ function Events.Register(player, bridgeUrl, playerUserId)
         postEvent("respawn", {})
     end)
 
-    -- Chat messages — always forwarded to CC (critical event)
-    -- DST's ontalk event doesn't carry the message text
-    -- Player chat goes through TheNet system; use talker.ontalk callback instead
-    if player.components.talker then
-        local originalOntalk = player.components.talker.ontalk
-        player.components.talker.ontalk = function(inst, script)
-            -- script is the message text (string) on server side
-            local message = type(script) == "string" and script or ""
-            if message and message ~= "" then
-                postEvent("chat", { message = message })
-            end
-            -- Call original if exists
-            if originalOntalk then
-                originalOntalk(inst, script)
-            end
-        end
-    end
+    -- Chat messages: handled by Networking_Say hook in modmain.lua
+    -- (talker.ontalk only captures character voice lines, not player-typed chat)
 
     print("[dst-bridge] events registered for " .. (player.name or "player"))
 end
