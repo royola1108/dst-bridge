@@ -16,6 +16,7 @@ import {
   formatSituation,
   formatWaitResult,
   formatInterruptResult,
+  appendUnreadChats,
 } from "./format.js";
 
 export function createServer() {
@@ -62,6 +63,12 @@ export function createServer() {
   function sendText(res, code, text) {
     res.writeHead(code, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(text);
+  }
+
+  // Send CLI response with unread chats appended
+  function sendCliText(res, code, text, puid) {
+    const withChats = appendUnreadChats(text, stateCache, puid);
+    sendText(res, code, withChats);
   }
 
   function resolvePlayer(args, query) {
@@ -169,34 +176,35 @@ export function createServer() {
 
         switch (tool) {
           case "state":
-            sendText(res, 200, formatState(stateCache.get(puid)));
+            sendCliText(res, 200, formatState(stateCache.get(puid)), puid);
             return;
 
           case "nearby":
-            sendText(res, 200, formatNearby(stateCache.get(puid), body));
+            sendCliText(res, 200, formatNearby(stateCache.get(puid), body), puid);
             return;
 
           case "inventory":
           case "inv":
-            sendText(res, 200, formatInventory(stateCache.get(puid)));
+            sendCliText(res, 200, formatInventory(stateCache.get(puid)), puid);
             return;
 
           case "events":
-            sendText(
+            sendCliText(
               res,
               200,
-              formatEvents(stateCache.get(puid), body.since, body.limit || 20)
+              formatEvents(stateCache.get(puid), body.since, body.limit || 20),
+              puid
             );
             return;
 
           case "status": {
             const uptime = Date.now() - startTime;
-            sendText(res, 200, formatStatus(stateCache, queue, puid, uptime, totalProcessed, config.port));
+            sendCliText(res, 200, formatStatus(stateCache, queue, puid, uptime, totalProcessed, config.port), puid);
             return;
           }
 
           case "queue":
-            sendText(res, 200, formatQueue(queue, puid));
+            sendCliText(res, 200, formatQueue(queue, puid), puid);
             return;
 
           case "do": {
@@ -212,7 +220,7 @@ export function createServer() {
               },
               puid
             );
-            sendText(res, 200, formatDoResult(cmd));
+            sendCliText(res, 200, formatDoResult(cmd), puid);
             return;
           }
 
@@ -220,7 +228,7 @@ export function createServer() {
           case "interrupt": {
             const cancelled = queue.cancelAll(puid);
             macro.interrupt();
-            sendText(res, 200, formatCancelResult(cancelled));
+            sendCliText(res, 200, formatCancelResult(cancelled), puid);
             return;
           }
 
@@ -233,7 +241,7 @@ export function createServer() {
             }
             const result = macro.start(goalText, puid);
             if (result.accepted) {
-              sendText(res, 200, `✓ ${result.message}`);
+              sendCliText(res, 200, `✓ ${result.message}`, puid);
             } else {
               sendText(res, 400, `✗ ${result.error}`);
             }
@@ -252,15 +260,15 @@ export function createServer() {
             for (const g of history.slice(-5).reverse()) {
               lines.push(`  [${g.status}] ${g.text} — ${g.reason || "completed"} (${Math.round((g.completedAt - g.startedAt) / 1000)}s ago)`);
             }
-            if (lines.length === 0) sendText(res, 200, "Goals: (none yet)");
-            else sendText(res, 200, `Goals:\n${lines.join("\n")}`);
+            if (lines.length === 0) sendCliText(res, 200, "Goals: (none yet)", puid);
+            else sendCliText(res, 200, `Goals:\n${lines.join("\n")}`, puid);
             return;
           }
 
           case "wait": {
             const timeout = body.timeout || config.waitDefaultTimeout;
             const result = await waiter.wait(puid, timeout);
-            sendText(res, 200, formatWaitResult(result));
+            sendCliText(res, 200, formatWaitResult(result), puid);
             return;
           }
 
@@ -274,14 +282,14 @@ export function createServer() {
             if (slot?.current?.player?.health < 30) alerts.push("⚠ health critical");
             if (slot?.current?.player?.hunger < 30) alerts.push("⚠ hunger critical");
             if (slot?.current?.world?.phase === "night" && !slot?.current?.player?.inLight) alerts.push("⚠ in darkness at night");
-            sendText(res, 200, formatSituation(slot, goal, events, alerts));
+            sendCliText(res, 200, formatSituation(slot, goal, events, alerts), puid);
             return;
           }
 
           case "interrupt": {
             const cancelled = queue.cancelAll(puid);
             macro.interrupt();
-            sendText(res, 200, formatInterruptResult(cancelled, macro));
+            sendCliText(res, 200, formatInterruptResult(cancelled, macro), puid);
             return;
           }
 

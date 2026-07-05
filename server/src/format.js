@@ -9,6 +9,15 @@ const BEARING_SHORT = {
   "behind-right": "BR",
 };
 
+// Append unread chat messages to any CLI output
+export function appendUnreadChats(text, stateCache, puid) {
+  if (!stateCache || !puid) return text;
+  const unread = stateCache.getUnreadChats(puid);
+  if (!unread || unread.length === 0) return text;
+  const lines = unread.map((e) => `  <${e.data.from || "player"}> ${e.data.message}`);
+  return text + "\n\nunread chat:\n" + lines.join("\n");
+}
+
 export function formatState(slot) {
   if (!slot || !slot.current) return "DST: NOT CONNECTED";
   const s = slot.current;

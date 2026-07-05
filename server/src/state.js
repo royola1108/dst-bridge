@@ -16,6 +16,7 @@ export class StateCache {
       seq: 0,
       events: [],
       eventSeq: 0,
+      lastReadEventSeq: 0,
     };
     this.slots.set(playerUserId, slot);
     return slot;
@@ -43,6 +44,18 @@ export class StateCache {
     let events = slot.events;
     if (since != null) events = events.filter((e) => e.seq > since);
     return events.slice(-limit);
+  }
+
+  // Get unread chat messages and mark them as read
+  getUnreadChats(playerUserId) {
+    const slot = this.get(playerUserId);
+    const unread = slot.events.filter(
+      (e) => e.seq > slot.lastReadEventSeq && e.kind === "chat" && e.data?.message?.trim()
+    );
+    if (unread.length > 0) {
+      slot.lastReadEventSeq = unread[unread.length - 1].seq;
+    }
+    return unread;
   }
 
   isConnected(playerUserId) {
