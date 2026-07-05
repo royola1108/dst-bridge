@@ -11,4 +11,6 @@ export const config = {
   deepseekUrl: process.env.DEEPSEEK_URL || "https://api.deepseek.com/v1/chat/completions",
   deepseekKey: process.env.DEEPSEEK_API_KEY || "",
   apiKey: process.env.DST_API_KEY || "",
+  hermesApiUrl: process.env.HERMES_API_URL || "http://127.0.0.1:8642/v1/chat/completions",
+  hermesApiKey: process.env.HERMES_API_KEY || "dst-bridge-reflex-api",
 };

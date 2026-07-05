@@ -1,26 +1,32 @@
-// deepseek.js — DeepSeek API client for reflex decisions
-// Uses SiliconFlow (OpenAI-compatible endpoint) or direct DeepSeek API
-// Falls back gracefully if no API key configured
+// deepseek.js — Reflex LLM client
+// Primary: Hermes API server (sync, has DST memory/skills/SOUL.md)
+// Fallback: direct SiliconFlow / DeepSeek API (stateless, fast)
 
 import { config } from "./config.js";
 
-const REFLEX_TIMEOUT = 8000; // 8 seconds max for reflex decision
+const REFLEX_TIMEOUT = 20000; // 20s — Hermes agent loop needs time for memory
 
 export async function callReflexLLM(prompt) {
   if (!prompt) return null;
 
-  // Try Hermes CLI first (has memory + skills), fall back to direct API
+  // Try Hermes API server first (has memory + skills + SOUL.md)
   try {
-    const result = await callHermes(prompt);
-    if (result) return result;
+    const result = await callHermesApi(prompt);
+    if (result) {
+      console.log("[reflex] hermes responded");
+      return result;
+    }
   } catch (e) {
     console.log("[reflex] hermes failed:", e.message);
   }
 
-  // Fall back to direct DeepSeek/SiliconFlow API
+  // Fall back to direct DeepSeek/SiliconFlow API (stateless)
   try {
     const result = await callDirectAPI(prompt);
-    if (result) return result;
+    if (result) {
+      console.log("[reflex] direct API responded");
+      return result;
+    }
   } catch (e) {
     console.log("[reflex] direct API failed:", e.message);
   }
@@ -28,63 +34,59 @@ export async function callReflexLLM(prompt) {
   return null;
 }
 
-// Call Hermes agent CLI — uses dont-starve profile for DST-specific memory/skills
-async function callHermes(prompt) {
-  const { execFile } = await import("node:child_process");
-  const path = (await import("node:path")).default;
-  const os = (await import("node:os")).default;
-
-  const hermesBin = path.join(os.homedir(), ".hermes/hermes-agent/venv/bin/hermes");
-  // Use dont-starve profile — has its own model, memory, skills, SOUL.md
-  const userMsg = `DST survival reflex. ${prompt.system}\n\n${prompt.user}`;
-
-  return new Promise((resolve) => {
-    const proc = execFile(
-      hermesBin,
-      ["-p", "dont-starve", "-z", userMsg],
-      {
-        timeout: REFLEX_TIMEOUT,
-        cwd: path.join(os.homedir(), ".hermes/profiles/dont-starve"),
-        env: { ...process.env, HOME: os.homedir() },
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          resolve(null);
-          return;
-        }
-        // Try to parse JSON from stdout
-        const text = stdout.trim();
-        try {
-          // Find JSON object in the response
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            resolve(JSON.parse(jsonMatch[0]));
-          } else {
-            resolve(null);
-          }
-        } catch {
-          resolve(null);
-        }
-      }
-    );
-    // Kill if timeout
-    setTimeout(() => {
-      proc.kill("SIGTERM");
-    }, REFLEX_TIMEOUT);
-  });
-}
-
-// Direct API call to SiliconFlow / DeepSeek (no Hermes)
-async function callDirectAPI(prompt) {
-  const apiKey = config.deepseekKey;
-  if (!apiKey) return null;
-
-  const baseUrl = config.deepseekUrl;
+// Call Hermes API server — OpenAI-compatible, sync, runs through gateway agent loop
+// Has dont-starve profile memory, skills, and SOUL.md loaded
+async function callHermesApi(prompt) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REFLEX_TIMEOUT);
 
   try {
-    const res = await fetch(baseUrl, {
+    const res = await fetch(config.hermesApiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.hermesApiKey}`,
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: "system", content: prompt.system },
+          { role: "user", content: prompt.user },
+        ],
+        max_tokens: 300,
+        temperature: 0.3,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      console.log(`[reflex] hermes API returned ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content || "";
+    return parseActionJson(text);
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === "AbortError") {
+      console.log("[reflex] hermes timeout");
+    }
+    return null;
+  }
+}
+
+// Direct API call to SiliconFlow / DeepSeek (no Hermes, no memory)
+async function callDirectAPI(prompt) {
+  const apiKey = config.deepseekKey;
+  if (!apiKey) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REFLEX_TIMEOUT);
+
+  try {
+    const res = await fetch(config.deepseekUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -96,7 +98,7 @@ async function callDirectAPI(prompt) {
           { role: "system", content: prompt.system },
           { role: "user", content: prompt.user },
         ],
-        max_tokens: 200,
+        max_tokens: 300,
         temperature: 0.3,
       }),
       signal: controller.signal,
@@ -111,11 +113,7 @@ async function callDirectAPI(prompt) {
 
     const data = await res.json();
     const text = data.choices?.[0]?.message?.content || "";
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return null;
+    return parseActionJson(text);
   } catch (e) {
     clearTimeout(timeoutId);
     if (e.name === "AbortError") {
@@ -123,4 +121,62 @@ async function callDirectAPI(prompt) {
     }
     return null;
   }
+}
+
+// Parse LLM response text — handles markdown code blocks, natural language wrappers
+// Maps common action name variants to our action system
+function parseActionJson(text) {
+  if (!text) return null;
+
+  // Strip markdown code fences
+  let cleaned = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+
+  // Find JSON object
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonMatch[0]);
+  } catch {
+    return null;
+  }
+
+  // Normalize action names
+  const ACTION_MAP = {
+    move_to: "walk_to",
+    walk: "walk_to",
+    goto: "walk_to",
+    go_to: "walk_to",
+    pickup: "pickup",
+    pick_up: "pickup",
+    gather: "pickup",
+    chop: "chop",
+    mine: "mine",
+    dig: "dig",
+    build: "build",
+    craft: "craft",
+    eat: "eat",
+    equip: "equip",
+    attack: "attack",
+    flee: "walk_to",
+    run: "walk_to",
+  };
+
+  if (parsed.action && ACTION_MAP[parsed.action]) {
+    parsed.action = ACTION_MAP[parsed.action];
+  }
+
+  // If action is "walk_to" but has a target name instead of pos, mark as needs resolution
+  if (parsed.action === "walk_to" && parsed.target && !parsed.pos) {
+    parsed.needsTargetResolution = parsed.target;
+    delete parsed.target;
+  }
+
+  // Must have a recognized action or escalate
+  if (!parsed.action && !parsed.escalate) {
+    return null;
+  }
+
+  return parsed;
 }

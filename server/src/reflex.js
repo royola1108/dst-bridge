@@ -58,6 +58,19 @@ export class ReflexEngine {
       try {
         const action = await callReflexLLM(this.buildPrompt(kind, event, playerUserId));
         if (action && action.action) {
+          // Resolve target name to GUID if LLM gave us a name instead of GUID
+          if (action.needsTargetResolution) {
+            const resolved = this.resolveTargetByName(action.needsTargetResolution, playerUserId);
+            if (resolved) {
+              action.targetGuid = resolved;
+              delete action.needsTargetResolution;
+            } else {
+              console.log(`[reflex] could not resolve target: ${action.needsTargetResolution}`);
+              this.log(kind, "llm_no_target", action);
+              this.macro.resume();
+              return;
+            }
+          }
           action.stateSeq = this.stateCache.get(playerUserId)?.seq || 0;
           this.cmdQueue.enqueue(action, playerUserId);
           this.log(kind, "llm", action);
@@ -197,6 +210,18 @@ export class ReflexEngine {
     }
   }
 
+  // Resolve a target name (from LLM) to a nearby entity GUID
+  resolveTargetByName(name, playerUserId) {
+    const state = this.stateCache.get(playerUserId)?.current;
+    if (!state?.nearby) return null;
+    const lower = name.toLowerCase();
+    // Exact prefab match first, then partial match
+    let entity = state.nearby.find((e) => e.prefab === lower);
+    if (!entity) entity = state.nearby.find((e) => e.prefab.includes(lower));
+    if (!entity) entity = state.nearby.find((e) => lower.includes(e.prefab));
+    return entity?.guid || null;
+  }
+
   // Build prompt for Hermes/DeepSeek
   buildPrompt(kind, event, playerUserId) {
     const state = this.stateCache.get(playerUserId)?.current;
@@ -218,24 +243,27 @@ export class ReflexEngine {
     const eventData = event.data ? JSON.stringify(event.data) : "";
 
     return {
-      system: `You are a Don't Starve Together survival AI. Make ONE action decision in 1 second.
-Output ONLY a JSON object, no explanation.
+      system: `You are a Don't Starve Together survival AI reflex system. Make ONE action decision immediately.
+Output ONLY a JSON object, no markdown, no explanation.
+Use the #GUID numbers from the Nearby list for targetGuid.
 Format: {"action":"walk_to","pos":{"x":0,"z":0}}
+Or: {"action":"pickup","targetGuid":12345}
 Or: {"action":"chop","targetGuid":12345}
 Or: {"action":"equip","invObjectGuid":12345}
 Or: {"action":"build","recipe":"campfire"}
 Or: {"action":"attack","targetGuid":12345}
 Or: {"action":"eat","targetGuid":12345}
+Or: {"action":"walk_to","pos":{"x":100,"z":200}}
 If the situation is too dangerous to handle alone, output: {"escalate":true,"reason":"brief reason"}`,
       user: `EMERGENCY: ${kind}${eventData ? " " + eventData : ""}
 State: HP:${p.health}/${p.maxHealth} Hgr:${p.hunger}/${p.maxHunger} San:${p.sanity}/${p.maxSanity}
 Day${w.cycle} ${w.season} ${w.phase} Light:${p.inLight ? "yes" : "no"} Ghost:${p.isGhost ? "yes" : "no"}
 Pos:(${Math.round(p.pos.x)},${Math.round(p.pos.z)}) Equip:${state.equipped?.hands?.prefab || "none"}
-Nearby:
+Nearby (use #GUID for targetGuid):
 ${nearbyStr || "  (nothing)"}
 Inventory:
 ${invStr || "  (empty)"}
-Make ONE decision:`,
+Output ONE JSON action:`,
     };
   }
 
