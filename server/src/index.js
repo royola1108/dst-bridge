@@ -331,7 +331,8 @@ export function createServer() {
 }
 
 // Auto-start when run directly (node src/index.js)
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { pathToFileURL } from "node:url";
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const s = createServer();
   s.listen();
 }
